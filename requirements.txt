@@ -1,0 +1,8 @@
+# ResMoE — tested with Python 3.12
+torch>=2.4
+transformers>=4.45
+datasets>=2.20
+numpy>=1.26
+# downstream eval (SuperGLUE / commonsense / HumanEval harnesses)
+lm-eval>=0.4.3
+# MultiPL-E Java evaluation also requires a JDK (javac/java) on PATH.

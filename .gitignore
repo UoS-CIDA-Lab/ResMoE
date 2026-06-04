@@ -1,0 +1,54 @@
+# --- large / regenerable artifacts ---
+*.pt
+*.safetensors
+*.bin
+ckpts/
+olmoe_layer0_cache.pt
+*_cache.pt
+
+# --- third-party papers (copyright) ---
+references/
+
+# --- separate project (its own git repo) ---
+decomposition_project/
+
+# --- paper + research notes / vibe-coding logs (kept locally, not committed) ---
+paper/
+EXPERIMENT_PLAN.md
+PAPER_DRAFT_ICSE.md
+PAPER_OUTLINE.md
+RESEARCH_OVERVIEW.md
+
+# --- logs / scratch ---
+*.log
+/tmp/
+nohup.out
+
+# --- python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# --- LaTeX build artifacts (keep .tex / .bib / .pdf) ---
+*.aux
+*.bbl
+*.blg
+*.out
+*.fdb_latexmk
+*.fls
+*.xdv
+*.synctex.gz
+paper/*.log
+
+# --- Java eval scratch ---
+mple_java/*.class
+mple_java/tmp*/
+mple_java/Problem*
+
+# --- editor / agent ---
+.claude/
+.vscode/
+.DS_Store
