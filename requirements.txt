@@ -3,6 +3,7 @@ torch>=2.4
 transformers>=4.45
 datasets>=2.20
 numpy>=1.26
+matplotlib>=3.7          # effective-rank depth-profile plot (252)
 # downstream eval (SuperGLUE / commonsense / HumanEval harnesses)
 lm-eval>=0.4.3
 # MultiPL-E Java evaluation also requires a JDK (javac/java) on PATH.
