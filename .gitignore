@@ -18,6 +18,8 @@ EXPERIMENT_PLAN.md
 PAPER_DRAFT_ICSE.md
 PAPER_OUTLINE.md
 RESEARCH_OVERVIEW.md
+summary.md
+
 
 # --- logs / scratch ---
 *.log
@@ -91,6 +93,7 @@ experiments/*
 !experiments/249_*.py
 !experiments/251_*.py
 !experiments/254_*.py
+!experiments/255_*.py
 !experiments/COLLAB_RUNBOOK.md
 
 # --- certification/exploratory library (not used by any paper script) ---

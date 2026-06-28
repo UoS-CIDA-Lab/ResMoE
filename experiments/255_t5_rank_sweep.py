@@ -1,17 +1,11 @@
-"""Experiment 254 — low-rank output correction on an ENCODER-DECODER (T5, ReLU): the architecture
-absent from the rest of the study (all others are decoder-only or BERT encoder). T5 v1.0 is the
-ORIGINAL MoEfication's home turf (ReLU, seq2seq). Same RQ3 "component-separation" protocol as 236
-(tab:baseline), at group-ORACLE selection (no router confound), perplexity, NO fine-tuning. Rows:
-  MoEfication/G-MoE grouping  : balanced k-means on wi INPUT-WEIGHT rows (parameter clustering) + mean rep
-  + keep-pattern grouping     : our co-keep-pattern clustering + mean rep (isolates the grouping gain)
-  + low-rank correction (Ours): keep-pattern + predicted rank-r correction (isolates the correction gain)
-  neuron-oracle               : per-neuron ceiling
-Every FFN (encoder.block[i].layer[1] AND decoder.block[i].layer[2]) is treated uniformly. Since T5 v1.0
-has no causal LM, "perplexity" = DENOISING (span-corruption) perplexity: corrupt source spans, teacher-
-force the decoder on the sentinel-delimited target, exp(mean CE). The SAME corrupted batches are reused
-across every config for a fair comparison. Use a NON-gated v1.0 checkpoint (t5-base/large/3b), NOT t5-v1_1
-/flan (gated-gelu, two wi). bf16 (T5 is fp16-unstable). NCALIB/NEVAL are WINDOW counts here.
-Run: HHMODEL=t5-base conda run -n resmoe python3 experiments/254_t5_encdec_relu.py
+"""Experiment 255 — correction-RANK sweep on an ENCODER-DECODER (T5, ReLU), the enc-dec analog of
+the paper's rank figure (fig:rank, originally mBERT keep25). ONE model, keep25, group-ORACLE
+selection (keep-pattern grouping), denoising (span-corruption) perplexity, NO fine-tuning. Reports
+Dense / Floor (group-oracle, no correction) / Ceiling (neuron-oracle) and ResMoE at each correction
+rank r in RANKS, to show the dropped-output error is low-rank (curve saturates by r=128 and crosses
+the floor). Shares 254's scaffolding (FFN enumeration, span-corruption pipeline, calibration, eval).
+Use a NON-gated v1.0 checkpoint (t5-base/large/3b), bf16. NCALIB/NEVAL are WINDOW counts.
+Run: HHMODEL=t5-large conda run -n resmoe python3 experiments/255_t5_rank_sweep.py
 """
 from __future__ import annotations
 import sys, pathlib, gc, os, math
@@ -19,35 +13,21 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
 
-MODEL = os.environ.get("HHMODEL", "t5-base")
+MODEL = os.environ.get("HHMODEL", "t5-large")
 SEQ = int(os.environ.get("SEQ", "512"))
-CHUNK = int(os.environ.get("CHUNK", "8"))          # batch of sequences per forward
-NCAL_WIN = int(os.environ.get("NCALIB", "48"))     # calibration windows
-NEVAL_WIN = int(os.environ.get("NEVAL", "48"))     # eval windows
-MAXROWS = int(os.environ.get("MAXROWS", "16384"))  # per-layer calib-row cap (memory guard, cf. 248)
-DENSITY = float(os.environ.get("NOISE", "0.15"))   # span-corruption noise density
-MEANSPAN = int(os.environ.get("MEANSPAN", "3"))    # mean noise span length
+CHUNK = int(os.environ.get("CHUNK", "8"))
+NCAL_WIN = int(os.environ.get("NCALIB", "128"))
+NEVAL_WIN = int(os.environ.get("NEVAL", "64"))
+MAXROWS = int(os.environ.get("MAXROWS", "16384"))
+DENSITY = float(os.environ.get("NOISE", "0.15"))
+MEANSPAN = int(os.environ.get("MEANSPAN", "3"))
 K = 128
-RCORR = 128
 RFEAT = 512
-KEEPS = [float(x) for x in os.environ.get("KEEPS", "0.50,0.25").split(",")]
+RANK_KEEP = float(os.environ.get("RANK_KEEP", "0.25"))                     # fig:rank uses keep25
+RANKS = [int(x) for x in os.environ.get("RANKS", "16,32,64,128").split(",") if x.strip()]
 
 
-# ---------------------------------------------------------------------------
-# Reused verbatim from 236_baseline_compare.py (activation-agnostic helpers).
-# ---------------------------------------------------------------------------
-def kmeans_centroids(X, k, iters=20, seed=0):
-    g = torch.Generator(device=X.device).manual_seed(seed)
-    c = X[torch.randperm(X.shape[0], generator=g, device=X.device)[:k]].clone()
-    for _ in range(iters):
-        a = torch.cdist(X, c).argmin(1)
-        for j in range(k):
-            m = a == j
-            if m.any():
-                c[j] = X[m].mean(0)
-    return c
-
-
+# --- helpers reused verbatim from 254/236 ---
 def weighted_kmeans_centroids(X, w, k, iters=20, seed=0):
     g = torch.Generator(device=X.device).manual_seed(seed)
     c = X[torch.randperm(X.shape[0], generator=g, device=X.device)[:k]].clone()
@@ -110,25 +90,19 @@ def gsizes(gl, dev):
     return gsz
 
 
-# ---------------------------------------------------------------------------
-# T5-specific: FFN enumeration + span-corruption (denoising) data pipeline.
-# ---------------------------------------------------------------------------
 def collect_t5_ffns(model):
-    """Flat parallel lists over EVERY FFN (encoder + decoder). gproj/downs mirror the
-    236 roles: gproj=wi (FFN input proj, captures x), downs=wo (output proj, input=a)."""
     assert not getattr(model.config, "is_gated_act", False), \
         "use a NON-gated T5 v1.0 (t5-base/large/3b), not t5-v1_1/flan (gated-gelu)"
     gproj, downs, tag = [], [], []
     for side, stack in (("enc", model.encoder), ("dec", model.decoder)):
         for bi, blk in enumerate(stack.block):
-            ff = blk.layer[-1].DenseReluDense            # FF is always layer[-1]
+            ff = blk.layer[-1].DenseReluDense
             assert hasattr(ff, "wi"), "non-gated T5 expected (single wi)"
             gproj.append(ff.wi); downs.append(ff.wo); tag.append(f"{side}{bi}")
     return gproj, downs, tag
 
 
 def _random_segmentation(num_items, num_segments, rng):
-    """Partition num_items into num_segments non-empty segments; return segment lengths."""
     if num_segments >= num_items:
         return np.ones(num_items, dtype=np.int64) if num_items == num_segments \
             else np.bincount(np.arange(num_items) % num_segments, minlength=num_segments)
@@ -140,14 +114,13 @@ def _random_segmentation(num_items, num_segments, rng):
 
 
 def random_spans_noise_mask(length, density, mean_span, rng):
-    """Standard T5 span-corruption mask. True where the token is noise (to be masked)."""
     num_noise = int(round(length * density))
     num_noise = min(max(num_noise, 1), length - 1)
     num_spans = max(int(round(num_noise / mean_span)), 1)
     num_nonnoise = length - num_noise
     noise_len = _random_segmentation(num_noise, num_spans, rng)
     nonnoise_len = _random_segmentation(num_nonnoise, num_spans, rng)
-    interleaved = np.stack([nonnoise_len, noise_len], axis=1).reshape(-1)  # nonnoise first
+    interleaved = np.stack([nonnoise_len, noise_len], axis=1).reshape(-1)
     span_starts = np.cumsum(interleaved)[:-1]
     indicator = np.zeros(length, dtype=np.int64)
     indicator[span_starts] = 1
@@ -155,7 +128,6 @@ def random_spans_noise_mask(length, density, mean_span, rng):
 
 
 def _corrupt_one(toks, is_noise, sentinels, eos):
-    """Replace each maximal noise span with one sentinel (inputs); emit sentinel+span tokens (targets)."""
     inp, tgt = [], []
     si = 0; prev_noise = False
     for t, noise in zip(toks, is_noise):
@@ -170,7 +142,6 @@ def _corrupt_one(toks, is_noise, sentinels, eos):
 
 
 def build_corrupted_batches(tok, windows, batch_size, density, mean_span, seed):
-    """Build a fixed list of teacher-forcing batches once; reuse across ALL configs."""
     sentinels = [tok.convert_tokens_to_ids(f"<extra_id_{i}>") for i in range(100)]
     eos = tok.eos_token_id; pad = tok.pad_token_id
     rng = np.random.default_rng(seed)
@@ -203,7 +174,6 @@ def main():
     n_enc = sum(t.startswith("enc") for t in tag)
     torch.set_grad_enabled(False)
 
-    # --- corpus -> SEQ-token windows -> disjoint calib / eval corrupted batches ---
     ds = load_dataset(os.environ.get("WIKI_REPO", "Salesforce/wikitext"),
                       os.environ.get("WIKI", "wikitext-103-raw-v1"), split="test")
     text = "\n".join(t for t in ds["text"] if t.strip())
@@ -251,7 +221,6 @@ def main():
         downs[li].register_forward_pre_hook(dpre(li))
         downs[li].register_forward_hook(dpost(li))
 
-    # --- calibration capture (enc+dec FFNs fire in one teacher-forced forward) ---
     capa = {li: [] for li in range(nL)}; capx = {li: [] for li in range(nL)}
     hs = []
     for li in range(nL):
@@ -280,48 +249,26 @@ def main():
     g = torch.Generator().manual_seed(0)
     for li in range(nL):
         a = torch.cat(capa[li]); x = torch.cat(capx[li])
-        if a.shape[0] > MAXROWS:                                   # joint subsample (a,x share rows)
+        if a.shape[0] > MAXROWS:
             idx = torch.randperm(a.shape[0], generator=g)[:MAXROWS]
             a = a[idx]; x = x[idx]
         x = x.float().to(dev)
         Wd = downs[li].weight.detach().float().to(dev); Wd = Wd if Wd.shape[1] == dff else Wd.T
-        Wg = gproj[li].weight.detach().float().to(dev)             # [m,d] wi input-weight rows
-        Wg = Wg if Wg.shape[0] == dff else Wg.T
         af = a.float().to(dev); vn = Wd.norm(dim=0); abar = af.mean(0)
         xbar = x.mean(0); _, _, VtX = torch.linalg.svd(x - xbar, full_matrices=False)
-        STR[li] = dict(a=a, x=x.half().cpu(), abar=abar, vn=vn, Wd=Wd.cpu(), Wg=Wg.cpu(), xbar=xbar, P=VtX[:RFEAT].T)
+        STR[li] = dict(a=a, x=x.half().cpu(), abar=abar, vn=vn, Wd=Wd.cpu(), xbar=xbar, P=VtX[:RFEAT].T)
         capa[li] = None; capx[li] = None
-        del af, x, Wd, Wg; gc.collect(); torch.cuda.empty_cache()
+        del af, x, Wd; gc.collect(); torch.cuda.empty_cache()
     print(f"  MODEL={MODEL} dff={dff} nL={nL} (enc {n_enc} + dec {nL - n_enc}) "
-          f"calib_rows enc={STR[0]['a'].shape[0]} dec={STR[nL-1]['a'].shape[0]}", flush=True)
+          f"keep{int(RANK_KEEP*100)} ranks={RANKS}", flush=True)
 
-    def grouping_weight(li):                                       # G-MoE/MoEfication: param clustering
-        s = STR[li]; Wg = s['Wg'].float().to(dev)
-        gl = balanced_assign(Wg, kmeans_centroids(Wg, K, seed=0))
-        del Wg; gc.collect(); torch.cuda.empty_cache()
-        return gsizes(gl, dev), gl
-
-    def grouping_keeppattern(li, bf):                             # ours
+    def grouping_keeppattern(li, bf):
         s = STR[li]; a = s['a'].float().to(dev); vn = s['vn']; abar = s['abar']; B = int(round(bf * dff))
         Bind = keep_topB_neuron((a - abar).abs() * vn, B).float()
         w = ((a - abar).abs() * vn).mean(0)
         gl = balanced_assign(Bind.T.contiguous(), weighted_kmeans_centroids(Bind.T.contiguous(), w, K, seed=0))
         del a, Bind; gc.collect(); torch.cuda.empty_cache()
         return gsizes(gl, dev), gl
-
-    def basis_and_pred(li, bf, gsz, gf):
-        s = STR[li]; a = s['a'].float().to(dev); abar = s['abar']; Wd = s['Wd'].to(dev)
-        B = int(round(bf * dff))
-        m = oracle_mask(a, abar, s['vn'], gsz, gf, B)
-        drop = a - (a * m + abar * (1 - m))
-        E = drop @ Wd.T
-        del a, m, drop, Wd; gc.collect(); torch.cuda.empty_cache()
-        Ec = E.cpu(); _, _, Vt = torch.linalg.svd(Ec, full_matrices=False); Br = Vt[:RCORR].T.to(dev)
-        c = E @ Br
-        z = (s['x'].float().to(dev) - s['xbar']) @ s['P']
-        pred = mlp_fit(z, c, dev)
-        del E, Ec, Vt, c, z; gc.collect(); torch.cuda.empty_cache()
-        return Br, pred
 
     def setcfg(bf, GRP, mode, BR=None, PRED=None):
         B = int(round(bf * dff))
@@ -336,24 +283,43 @@ def main():
         for li in range(nL):
             CFG[li]['active'] = False; CFG[li]['corr'] = False; CFG[li]['neuron'] = False
 
-    dense = ce_eval(); print(f"  dense denoising-ppl {dense:.3f}\n", flush=True)
-    for bf in KEEPS:
-        GW = {li: grouping_weight(li) for li in range(nL)}
-        GP = {li: grouping_keeppattern(li, bf) for li in range(nL)}
-        setcfg(bf, GW, 'group'); gmoe = ce_eval(); off()
-        setcfg(bf, GP, 'group'); ours_grp = ce_eval(); off()
-        BR = {}; PRED = {}
-        for li in range(nL):
-            BR[li], PRED[li] = basis_and_pred(li, bf, *GP[li])
-        setcfg(bf, GP, 'corr', BR, PRED); ours_full = ce_eval(); off()
-        setcfg(bf, GP, 'neuron'); neu = ce_eval(); off()
-        print(f"  === keep{int(bf*100)} (dense {dense:.3f}) ===", flush=True)
-        print(f"    G-MoE/MoEfication grouping (weight k-means + mean)  {gmoe:.3f}", flush=True)
-        print(f"    + keep-pattern grouping (ours grouping)             {ours_grp:.3f}", flush=True)
-        print(f"    + low-rank correction (OURS full = ResMoE)          {ours_full:.3f}", flush=True)
-        print(f"    neuron-oracle (ceiling)                             {neu:.3f}\n", flush=True)
-    print("READ: each row adds one of our components over the G-MoE baseline (all at oracle selection),"
-          "\n      on an encoder-decoder (T5/ReLU) — the architecture absent from the rest of the study.", flush=True)
+    # --- rank sweep at a single keep (fig:rank analog) ---
+    bf = RANK_KEEP
+    dense = ce_eval()
+    GP = {li: grouping_keeppattern(li, bf) for li in range(nL)}
+    setcfg(bf, GP, 'group'); floor = ce_eval(); off()
+    setcfg(bf, GP, 'neuron'); ceil = ce_eval(); off()
+
+    # per-layer E + SVD computed ONCE; MLP refit per rank (output dim = rank)
+    BR = {r: {} for r in RANKS}; PRED = {r: {} for r in RANKS}
+    rmax = max(RANKS)
+    for li in range(nL):
+        s = STR[li]; a = s['a'].float().to(dev); abar = s['abar']; Wd = s['Wd'].to(dev)
+        B = int(round(bf * dff))
+        m = oracle_mask(a, abar, s['vn'], GP[li][0], GP[li][1], B)
+        drop = a - (a * m + abar * (1 - m))
+        E = drop @ Wd.T
+        del a, m, drop, Wd; gc.collect(); torch.cuda.empty_cache()
+        Ec = E.cpu(); _, _, Vt = torch.linalg.svd(Ec, full_matrices=False)
+        z = (s['x'].float().to(dev) - s['xbar']) @ s['P']
+        for r in RANKS:
+            Br = Vt[:r].T.to(dev); c = E @ Br
+            BR[r][li] = Br; PRED[r][li] = mlp_fit(z, c, dev)
+            del Br, c
+        del E, Ec, Vt, z; gc.collect(); torch.cuda.empty_cache()
+
+    resmoe = {}
+    for r in RANKS:
+        setcfg(bf, GP, 'corr', BR[r], PRED[r]); resmoe[r] = ce_eval(); off()
+
+    print(f"\n  === rank sweep (keep{int(bf*100)}, {MODEL}) — denoising perplexity ===", flush=True)
+    print(f"    Dense                         {dense:.3f}", flush=True)
+    print(f"    Floor (group-oracle, no corr) {floor:.3f}", flush=True)
+    for r in RANKS:
+        print(f"    ResMoE  rank {r:4d}            {resmoe[r]:.3f}", flush=True)
+    print(f"    Ceiling (neuron-oracle)       {ceil:.3f}", flush=True)
+    print("READ: ResMoE perplexity vs correction rank at keep25 (enc-dec analog of fig:rank);"
+          "\n      expect it to drop from the Floor toward the Ceiling and saturate by r=128.", flush=True)
 
 
 if __name__ == "__main__":
