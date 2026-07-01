@@ -47,6 +47,7 @@ def balanced_assign(X, centroids):
 
 
 def mlp_fit(X, Y, dev, steps=3000, hidden=512, lr=3e-3, bs=2048):
+    torch.manual_seed(0)  # pin Linear init so the predictor is a deterministic fn of (X,Y) across scripts
     net = nn.Sequential(nn.Linear(X.shape[1], hidden), nn.GELU(), nn.Linear(hidden, Y.shape[1])).to(dev).float()
     opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
     gen = torch.Generator(device=dev).manual_seed(0)
@@ -84,10 +85,12 @@ def main():
     code = []
     for sp in ["train", "test", "validation", "prompt"]:
         try:
-            code += load_dataset("mbpp", split=sp, trust_remote_code=True)["code"]
-        except Exception:
-            pass
+            code += load_dataset("google-research-datasets/mbpp", "full", split=sp)["code"]
+        except Exception as _e:
+            print(f"  [mbpp load] split {sp} FAILED: {type(_e).__name__}: {str(_e)[:120]}", flush=True)
+    print(f"  [mbpp load] code items={len(code)}", flush=True)
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
+    print(f"  [mbpp load] ids tokens={ids.numel()}", flush=True)
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, trust_remote_code=True).to(dev).eval()
     model.config.use_cache = False
     layers = model.model.layers; nL = len(layers)

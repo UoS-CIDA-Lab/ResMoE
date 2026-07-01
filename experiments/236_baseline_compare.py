@@ -61,6 +61,7 @@ def balanced_assign(X, centroids):
 
 
 def mlp_fit(X, Y, dev, steps=3000, hidden=512, lr=3e-3, bs=2048):
+    torch.manual_seed(0)  # pin Linear init so the predictor is a deterministic fn of (X,Y) across scripts
     net = nn.Sequential(nn.Linear(X.shape[1], hidden), nn.GELU(), nn.Linear(hidden, Y.shape[1])).to(dev).float()
     opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
     gen = torch.Generator(device=dev).manual_seed(0)
@@ -105,7 +106,7 @@ def main():
     code = []
     for sp in ["train", "test", "validation", "prompt"]:
         try:
-            code += load_dataset("mbpp", split=sp, trust_remote_code=True)["code"]
+            code += load_dataset("google-research-datasets/mbpp", "full", split=sp)["code"]
         except Exception:
             pass
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
