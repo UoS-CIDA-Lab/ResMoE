@@ -65,6 +65,22 @@ HHMODEL=ckpts/santacoder-java PPL=1 KEEPS=0.85,0.50 \
     python3 experiments/243_santacoder_java_corr.py
 ```
 
+## Results trimmed from the paper (10-page limit)
+
+Three floats were moved out of the main paper for space. Their headline numbers are
+stated inline in the paper; the full typeset versions live in
+`paper/icse_resmoe_supplementary.tex`:
+
+- **Correction-rank sweep** (mBERT, keep25) — rank 16 already crosses the group-oracle
+  floor and quality saturates by `r=128` (~84% of the floor→ceiling gap closed).
+  Reproduce: `RANKS=16,32,64,128 python3 experiments/235_bert_mlm.py`.
+- **Correction internals** (Qwen-Coder-1.5B, oracle selection, rank 128) — the SVD basis
+  is essential (keep50 `3.96` vs. random-basis `4.34`; keep25 `4.99` vs. `7.78`), a linear
+  ridge predictor ≈ MLP, and predicted vs. oracle coordinates cost little.
+- **Quantization composability** (Qwen-Coder-1.5B, keep50) — the correction recovers the
+  selection floor at 16/8/4-bit weights, so the FFN-width saving stacks multiplicatively
+  with quantization.
+
 ## Notes
 - Oracle / per-neuron references use true activations and are **upper bounds**, not
   deployable; deployable numbers use the `x`-router (+ shared floor) and the
