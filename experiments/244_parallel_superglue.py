@@ -101,7 +101,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    wt = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
+    wt = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train")
     buf = []
     for t in wt["text"]:
         if t.strip():

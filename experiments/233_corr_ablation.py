@@ -94,7 +94,7 @@ def main():
     code = []
     for sp in ["train", "test", "validation", "prompt"]:
         try:
-            code += load_dataset("mbpp", split=sp, trust_remote_code=True)["code"]
+            code += load_dataset("google-research-datasets/mbpp", "full", split=sp)["code"]
         except Exception:
             pass
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]

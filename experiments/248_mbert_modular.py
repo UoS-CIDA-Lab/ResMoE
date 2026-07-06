@@ -109,8 +109,8 @@ def main():
 
     def load_split(lang, split):
         if TASK == "ner":
-            return load_dataset("wikiann", lang, split=split, trust_remote_code=True)
-        return load_dataset("xtreme", f"udpos.{UDNAME[lang]}", split=split, trust_remote_code=True)
+            return load_dataset("unimelb-nlp/wikiann", lang, split=split)
+        return load_dataset("google/xtreme", f"udpos.{UDNAME[lang]}", split=split)
     tr = concatenate_datasets([load_split(l, "train") for l in LANGS]).shuffle(seed=0)
     te = concatenate_datasets([load_split(l, "test") for l in LANGS])
     # derive label names from the dataset (robust to schema/order)

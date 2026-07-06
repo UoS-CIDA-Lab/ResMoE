@@ -1,9 +1,16 @@
 # ResMoE — tested with Python 3.12
-torch>=2.4
+# torch pinned to 2.7.1: its default PyPI wheel is cu126, which runs on CUDA 12.x
+# drivers (verified on driver 12.3). Newer torch defaults to cu130 wheels that
+# need a CUDA 13 driver (2.12.1+cu130 -> cuda unavailable here). torch<2.6 is
+# also ruled out: transformers 5.x refuses to torch.load .bin checkpoints
+# (e.g. facebook/opt-1.3b) on torch<2.6 (CVE-2025-32434).
+torch==2.7.1
 transformers>=4.45
 datasets>=2.20
 numpy>=1.26
 matplotlib>=3.7          # effective-rank depth-profile plot (252)
+seqeval                  # NER span-F1 (248 mBERT modularity)
 # downstream eval (SuperGLUE / commonsense / HumanEval harnesses)
 lm-eval>=0.4.3
+accelerate>=1.1        # hard import of lm_eval.models.huggingface (211/232/237/238/244)
 # MultiPL-E Java evaluation also requires a JDK (javac/java) on PATH.

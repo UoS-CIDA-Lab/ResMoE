@@ -79,7 +79,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     CALIB = os.environ.get("CALIB", "wikitext")               # in-domain (natural language) for commonsense
     if CALIB == "wikitext":
-        wt = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
+        wt = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train")
         buf = []
         for t in wt["text"]:
             if t.strip():
@@ -91,7 +91,7 @@ def main():
         code = []
         for sp in ["train", "test", "validation", "prompt"]:
             try:
-                code += load_dataset("mbpp", split=sp, trust_remote_code=True)["code"]
+                code += load_dataset("google-research-datasets/mbpp", "full", split=sp)["code"]
             except Exception:
                 pass
         ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]

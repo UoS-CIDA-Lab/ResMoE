@@ -92,7 +92,7 @@ def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     # wikitext-103 train: enough tokens for the largest sweep point
-    wt = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
+    wt = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train")
     need = max(SWEEP) + N_STRUCT + CHUNK
     buf, ntok = [], 0
     for t in wt["text"]:

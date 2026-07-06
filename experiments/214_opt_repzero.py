@@ -73,7 +73,7 @@ def main():
     from datasets import load_dataset
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    wt = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    wt = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
     ids = tok("\n\n".join(t for t in wt["text"] if t.strip()), return_tensors="pt").input_ids[0]
     print(f"  MODEL={MODEL}  tokens={ids.numel()}", flush=True)
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16).to(dev).eval()
