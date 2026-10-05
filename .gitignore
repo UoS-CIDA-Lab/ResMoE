@@ -21,7 +21,14 @@ RESEARCH_OVERVIEW.md
 summary.md
 
 
+# --- review material, local TeX installer, javac crash-argument dumps from the MultiPL-E harness ---
+icse2027_review.txt
+install-tl-*/
+install-tl-unx.tar.gz
+javac.*.args
+
 # --- logs / scratch ---
+results/
 *.log
 /tmp/
 nohup.out
@@ -92,8 +99,13 @@ experiments/*
 !experiments/248_*.py
 !experiments/249_*.py
 !experiments/251_*.py
+!experiments/252_*.py
+!experiments/253_*.py
 !experiments/254_*.py
 !experiments/255_*.py
+!experiments/256_*.py
+!experiments/257_*.py
+!experiments/258_*.py
 !experiments/COLLAB_RUNBOOK.md
 
 # --- certification/exploratory library (not used by any paper script) ---
