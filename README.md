@@ -46,8 +46,6 @@ pip install -r requirements.txt          # Python 3.12, CUDA GPU
 | `experiments/247_behavior.py`      | Behavior preservation: next-token top-1 agreement + KL vs dense |
 | `experiments/249_representative.py`| Representative ablation: zero / mean / conditional-mean / rank-r correction |
 | `experiments/246_wallclock.py`     | Realized FFN-sublayer latency (static gather vs dynamic mask) |
-| `experiments/251_santacoder_java_ft.py` | Fine-tune base SantaCoder on Java (reproduces G-MoEfication's fine-tuned model) |
-| `experiments/243_santacoder_java_corr.py` | SantaCoder MultiPL-E Java: G-MoE baseline vs ResMoE build-up (construction → shared floor → correction), `PPL=1` for perplexity or pass@1 |
 
 ### Common environment variables
 - `HHMODEL` — HF model id or local checkpoint path
