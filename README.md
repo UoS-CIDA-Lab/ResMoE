@@ -444,8 +444,9 @@ NTOK=4096 python -u experiments/246_wallclock.py \
 
 `246` downloads no model: random inputs/weights with Qwen dimensions, fp16,
 15 warmup and 50 timed iterations, reporting median component latency. Static
-selection uses smaller gathered GEMMs; dynamic dense masking still computes the
-full FFN. These are synthetic FFN measurements, not end-to-end inference speedups.
+selection uses smaller gathered GEMMs. The full FFN + mask reference computes all
+activations and applies one fixed mask shared by every token. These are synthetic
+FFN measurements, not end-to-end inference speedups.
 `253` measures repeated conversion runs, not a conversion-seed uncertainty study.
 
 ### Earlier experiments retained in the repository
