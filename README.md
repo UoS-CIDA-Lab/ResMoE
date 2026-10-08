@@ -499,6 +499,22 @@ unnormalized input-weight rows, followed by greedy equal-size assignment.
 Its weight-grouping result differs from the normalized `KMeansConstrained`
 baseline implemented by `236` and `254_matched_compute_xrouter.py`.
 
+Retained T5-large SST-2 fine-tuning and downstream comparison. Run the checkpoint
+producer before the evaluator. The producer loads the complete 67,349-example
+training split and runs three epochs; the evaluator uses 4,000 calibration
+examples and all 872 validation examples at both retained-neuron budgets:
+
+```bash
+HHMODEL=google-t5/t5-large TASK=sst2 OPT=adafactor LR=1e-3 EPOCHS=3 \
+  BS=16 ACCUM=4 SEQ=128 MAXTRAIN=0 OUT=ckpts/t5-large-sst2 \
+  python -u experiments/256_t5_glue_ft.py \
+  2>&1 | tee experiments/results/reproduction/t5-large-sst2-ft.log
+HHMODEL=ckpts/t5-large-sst2 TASK=sst2 K=128 NCAL=4000 NEVAL=0 \
+  SEQ=128 CHUNK=16 MAXROWS=16384 KEEPS=0.20,0.25 \
+  python -u experiments/257_t5_glue_corr.py \
+  2>&1 | tee experiments/results/reproduction/t5-large-sst2.log
+```
+
 T5 downstream exploration (SST-2 zero-shot; MNLI fine-tuning, separate from the
 submitted denoising grid). Expert counts follow `d_ff/32`, and checkpoint names
 must be explicitly selected rather than relying on the large-model default:
