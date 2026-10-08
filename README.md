@@ -356,11 +356,17 @@ for seed in 0 1 2; do
     2>&1 | tee "experiments/results/reproduction/mbert-ranks-$seed.log"
   for model in Qwen/Qwen2.5-Coder-1.5B Qwen/Qwen2.5-7B; do
     calibration_device=model
-    if [ "$model" = Qwen/Qwen2.5-7B ]; then calibration_device=cpu; fi
-    HHMODEL="$model" SEED="$seed" CALIBRATION_DEVICE="$calibration_device" \
-      NCALIB=8192 CHUNK=512 KEEPS=0.50,0.25 \
-      python -u experiments/228_deployable_correction.py \
-      2>&1 | tee "experiments/results/reproduction/decoder-ranks-${model##*/}-$seed.log"
+    keep_runs="0.50,0.25"
+    if [ "$model" = Qwen/Qwen2.5-7B ]; then
+      calibration_device=cpu
+      keep_runs="0.50 0.25"
+    fi
+    for keep_run in $keep_runs; do
+      HHMODEL="$model" SEED="$seed" CALIBRATION_DEVICE="$calibration_device" \
+        NCALIB=8192 CHUNK=512 KEEPS="$keep_run" \
+        python -u experiments/228_deployable_correction.py \
+        2>&1 | tee "experiments/results/reproduction/decoder-ranks-${model##*/}-$seed-$keep_run.log"
+    done
   done
   for bits in 0 8 4; do
     HHMODEL=Qwen/Qwen2.5-Coder-1.5B SEED="$seed" NCALIB=8192 CHUNK=512 \
@@ -383,6 +389,7 @@ and true-coordinate references; keep50/25 are hardcoded. `228` fits 128
 coordinates, then truncates for its rank16/32/64/128 comparison. CPU calibration
 keeps all 8192 tokens and bounds GPU memory, but changes the SVD device/layout;
 use `CALIBRATION_DEVICE=model` for the original Coder rank row and `cpu` for 7B.
+The 7B keep50 and keep25 conditions run in separate processes, as in the paper.
 `QBITS=0` is fp16; 8/4 are fake-quantized weights dequantized to fp16 for evaluation,
 so the quantization experiment measures quality, not integer-kernel latency.
 The spectral diagnostic is separate from the final conversion runs.
