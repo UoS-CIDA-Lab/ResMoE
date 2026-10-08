@@ -84,6 +84,7 @@ python -m pip install --no-cache-dir -r requirements.txt
 python -m pip check
 mkdir -p experiments/results/reproduction
 python -m pip freeze > experiments/results/reproduction/environment.txt
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
 export OMP_NUM_THREADS=8
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
