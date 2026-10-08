@@ -581,3 +581,48 @@ large-model memory requirements, and the complete multi-seed/full-length benchma
 grid were not validated by these reduced checks. The complete reproduction commands
 above retain the paper's budgets and seeds. A four-token Java completion test is
 expected to have poor pass@1 and makes no benchmark-quality claim.
+
+### Full workload validation (2026-10-08)
+
+A separate source-only clone, new Python/JDK installation and virtual environment,
+and dedicated Hugging Face caches were used for the full workload. Model weights,
+datasets, and fine-tuned checkpoints were obtained within this run. The pinned
+environment above passed `pip check`, CUDA computation and Java prerequisite
+checks. Only physical GPUs **0, 1, 2, 3** (RTX A6000, 48 GB each) were used.
+
+The frozen verification matrix contains **132 unique process configurations across
+all 47 numbered entrypoints**: 65 main/grid configurations, 31 core configurations,
+12 earlier retained configurations, and 24 downstream configurations. These are
+process configurations; a process can evaluate several keeps, ranks, methods or
+internal seeds. All 132 completed with native exit code zero and passed their
+complete-output checks. Calibration sizes, fitting iterations, training epochs,
+evaluation sets, keeps and seeds retained their original full-workload values.
+
+| Workload | Full execution checked |
+|---|---|
+| Decoder/encoder grids and diagnostics | Named retained model rows, original calibration/evaluation slices, ranks, keeps, conversion repetitions, finite metrics, and generated result artifacts |
+| HumanEval | Both retained uncertainty models, all 164 problems, conversion seeds 0–4, original generation budgets and 10,000 bootstrap resamples; historical HumanEval entrypoints also completed |
+| Java | Fresh SantaCoder checkpoint producer with 2,500 optimizer steps; all 158 problems for conversion seeds 0–2 on dense and keep-85 routed rows, greedy and ten sampled candidates per method, pass@1/5/10 and 5,000 bootstrap resamples; complete keep-50 perplexity evaluation |
+| mBERT NER/POS | All nine languages, complete two-epoch task-specific fine-tuning at seed 0, conversion seeds 0–2 using each task's same checkpoint, six keeps and five methods per keep; all 81,000 NER and 63,209 POS test examples |
+| T5 | All four retained denoising model sizes; T5-large SST-2 checkpoint production from the complete 67,349-example training split for three epochs and evaluation on all 872 examples at both keeps |
+| Other downstream and retained experiments | Complete retained GLUE, SuperGLUE, commonsense, quantization, selection, correction, grouping, behavior and timing configurations |
+
+Checks used actual child-process exit codes and complete per-configuration output
+requirements, including expected row counts, finite metrics, source/log hashes,
+result/checkpoint hashes and checkpoint reload evidence. Interrupted attempts were
+retained in execution history and excluded from completion; the affected full
+configuration was restarted from its beginning. A separate subagent reviewed the
+frozen matrix, paper/README protocols, process evidence and current artifacts.
+
+The matrix covers the named retained result configurations and earlier scripts;
+architecture-size examples mentioned only in the paper's inventory, optional MNLI
+exploration, and discarded RACE exploration are outside this verification matrix.
+The setup and download logs record the separate environment and cache paths; an
+initial empty-cache inventory was not saved. This is full execution verification,
+not a claim of bitwise reproduction of submitted scores or timings on different
+hardware/software. In particular, synthetic fixed-mask timing and fake
+quantization do not establish end-to-end integer-kernel inference speed.
+
+The audited source tree was `80b0bde` (subsequent documentation-only updates do
+not change the scientific scripts). The immutable matrix SHA-256 is
+`6491348b2d5a60e53ce14b4e870228ce555580b9f7ef97d708acc0f144c0f05d`.
