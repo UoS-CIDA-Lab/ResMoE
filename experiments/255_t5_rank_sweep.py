@@ -5,7 +5,7 @@ Dense / Floor (group-oracle, no correction) / Ceiling (neuron-oracle) and ResMoE
 rank r in RANKS, to show the dropped-output error is low-rank (curve saturates by r=128 and crosses
 the floor). Shares 254's scaffolding (FFN enumeration, span-corruption pipeline, calibration, eval).
 Use a NON-gated v1.0 checkpoint (t5-base/large/3b), bf16. NCALIB/NEVAL are WINDOW counts.
-Run: HHMODEL=t5-large conda run -n resmoe python3 experiments/255_t5_rank_sweep.py
+Run: HHMODEL=google-t5/t5-large conda run -n resmoe python3 experiments/255_t5_rank_sweep.py
 """
 from __future__ import annotations
 import sys, pathlib, gc, os, math
@@ -13,7 +13,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
 
-MODEL = os.environ.get("HHMODEL", "t5-large")
+MODEL = os.environ.get("HHMODEL", "google-t5/t5-large")
 SEQ = int(os.environ.get("SEQ", "512"))
 CHUNK = int(os.environ.get("CHUNK", "8"))
 NCAL_WIN = int(os.environ.get("NCALIB", "128"))

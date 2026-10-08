@@ -11,7 +11,7 @@ has no causal LM, "perplexity" = DENOISING (span-corruption) perplexity: corrupt
 force the decoder on the sentinel-delimited target, exp(mean CE). The SAME corrupted batches are reused
 across every config for a fair comparison. Use a NON-gated v1.0 checkpoint (t5-base/large/3b), NOT t5-v1_1
 /flan (gated-gelu, two wi). bf16 (T5 is fp16-unstable). NCALIB/NEVAL are WINDOW counts here.
-Run: HHMODEL=t5-base conda run -n resmoe python3 experiments/254_t5_encdec_relu.py
+Run: HHMODEL=google-t5/t5-base conda run -n resmoe python3 experiments/254_t5_encdec_relu.py
 """
 from __future__ import annotations
 import sys, pathlib, gc, os, math
@@ -19,7 +19,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
 
-MODEL = os.environ.get("HHMODEL", "t5-base")
+MODEL = os.environ.get("HHMODEL", "google-t5/t5-base")
 SEQ = int(os.environ.get("SEQ", "512"))
 CHUNK = int(os.environ.get("CHUNK", "8"))          # batch of sequences per forward
 NCAL_WIN = int(os.environ.get("NCALIB", "48"))     # calibration windows

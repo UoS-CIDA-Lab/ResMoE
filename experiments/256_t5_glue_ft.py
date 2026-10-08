@@ -9,7 +9,7 @@ from __future__ import annotations
 import os, pathlib, random
 import torch
 
-MODEL = os.environ.get("HHMODEL", "t5-large")
+MODEL = os.environ.get("HHMODEL", "google-t5/t5-large")
 TASK = os.environ.get("TASK", "sst2")                       # sst2 | mnli | race
 OUT = os.environ.get("OUT", str(pathlib.Path(__file__).resolve().parents[1] / "ckpts" / f"t5-large-{TASK}"))
 OPT = os.environ.get("OPT", "adafactor")                    # adafactor (T5 standard) | adam

@@ -13,7 +13,7 @@ import sys, pathlib, gc, os
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch, torch.nn as nn, torch.nn.functional as F
 
-MODEL = os.environ.get("HHMODEL", "t5-large")
+MODEL = os.environ.get("HHMODEL", "google-t5/t5-large")
 TASK = os.environ.get("TASK", "sst2")
 SEQ = int(os.environ.get("SEQ", "512" if TASK == "race" else "128"))
 NCAL = int(os.environ.get("NCAL", "4000"))                 # calibration train examples

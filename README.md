@@ -134,7 +134,7 @@ HHMODEL=facebook/opt-125m NCALIB=512 CHUNK=128 KEEPS=0.50 \
 HHMODEL=bert-base-uncased NCALIBSEG=2 NEVALSEG=1 KEEPS=0.50 RANKS=16 \
   python -u experiments/235_bert_mlm.py \
   2>&1 | tee experiments/results/reproduction/smoke-bert.log
-HHMODEL=t5-small WIKI=wikitext-2-raw-v1 NCALIB=2 NEVAL=1 CHUNK=1 MAXROWS=128 KEEPS=0.50 \
+HHMODEL=google-t5/t5-small WIKI=wikitext-2-raw-v1 NCALIB=2 NEVAL=1 CHUNK=1 MAXROWS=128 KEEPS=0.50 \
   python -u experiments/254_t5_encdec_relu.py \
   2>&1 | tee experiments/results/reproduction/smoke-t5.log
 ```
@@ -144,7 +144,7 @@ scripts as the retained T5 downstream experiments (four optimizer steps, not the
 paper's fine-tuning recipe):
 
 ```bash
-HHMODEL=t5-small TASK=mnli MAXTRAIN=16 EPOCHS=1 BS=2 ACCUM=2 \
+HHMODEL=google-t5/t5-small TASK=mnli MAXTRAIN=16 EPOCHS=1 BS=2 ACCUM=2 \
   OUT=ckpts/reproduction-smoke-t5-small-mnli \
   python -u experiments/256_t5_glue_ft.py \
   2>&1 | tee experiments/results/reproduction/smoke-checkpoint-ft.log
@@ -208,12 +208,15 @@ fine-tuning; these 128/64-window settings differ from the script's smoke default
 
 ```bash
 for model in t5-small t5-base t5-large t5-3b; do
-  HHMODEL="$model" WIKI=wikitext-103-raw-v1 NCALIB=128 NEVAL=64 SEQ=512 CHUNK=8 \
+  HHMODEL="google-t5/$model" WIKI=wikitext-103-raw-v1 NCALIB=128 NEVAL=64 SEQ=512 CHUNK=8 \
     MAXROWS=16384 NOISE=0.15 MEANSPAN=3 KEEPS=0.75,0.50,0.25 \
     python -u experiments/254_t5_encdec_relu.py \
     2>&1 | tee "experiments/results/reproduction/grid-$model.log"
 done
 ```
+
+Use the full `google-t5/` model IDs: the short `t5-*` aliases can fail with a
+404 at the Hugging Face Xet download endpoint in an empty cache.
 
 Grouping comparison and matched compute: official G-MoEfication **construction**
 uses normalized input weights and equal-size constrained k-means. The shared
@@ -476,7 +479,7 @@ substitutes for the final submission protocols above.
 | 243 | `HHMODEL=ckpts/santacoder-java PPL=1 KEEPS=0.85,0.50 python -u experiments/243_santacoder_java_corr.py` | Earlier Java-model perplexity; omit `PPL=1` for greedy Java pass@1 |
 | 244 | `HHMODEL=microsoft/phi-2 python -u experiments/244_parallel_superglue.py` | Parallel-block SuperGLUE extension |
 | 253 budget | `HHMODEL=facebook/opt-1.3b RANKMODE=budget python -u experiments/253_budget_correction.py` | Depth-adaptive rank; repeat with `RANKMODE=fixed` |
-| 255 T5 rank | `HHMODEL=t5-large WIKI=wikitext-103-raw-v1 NCALIB=128 NEVAL=64 RANK_KEEP=0.25 RANKS=16,32,64,128 python -u experiments/255_t5_rank_sweep.py` | Earlier T5 correction-rank sweep |
+| 255 T5 rank | `HHMODEL=google-t5/t5-large WIKI=wikitext-103-raw-v1 NCALIB=128 NEVAL=64 RANK_KEEP=0.25 RANKS=16,32,64,128 python -u experiments/255_t5_rank_sweep.py` | Earlier T5 correction-rank sweep |
 
 Unless overridden in the table, these scripts default to Qwen-Coder-1.5B. Some
 historical sweeps have no environment-variable override for token counts or seeds;
@@ -494,10 +497,10 @@ for size in small base large 3b; do
     large) experts=128; rate=3e-4 ;;
     3b) experts=512; rate=1e-4 ;;
   esac
-  HHMODEL="t5-$size" TASK=sst2 K="$experts" NCAL=4000 NEVAL=0 KEEPS=0.20,0.25 \
+  HHMODEL="google-t5/t5-$size" TASK=sst2 K="$experts" NCAL=4000 NEVAL=0 KEEPS=0.20,0.25 \
     python -u experiments/257_t5_glue_corr.py \
     2>&1 | tee "experiments/results/reproduction/t5-$size-sst2.log"
-  HHMODEL="t5-$size" TASK=mnli OPT=adafactor LR="$rate" EPOCHS=3 BS=16 ACCUM=4 \
+  HHMODEL="google-t5/t5-$size" TASK=mnli OPT=adafactor LR="$rate" EPOCHS=3 BS=16 ACCUM=4 \
     OUT="ckpts/t5-$size-mnli" python -u experiments/256_t5_glue_ft.py \
     2>&1 | tee "experiments/results/reproduction/t5-$size-mnli-ft.log"
   HHMODEL="ckpts/t5-$size-mnli" TASK=mnli K="$experts" NCAL=4000 NEVAL=0 KEEPS=0.20,0.25 \
