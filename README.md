@@ -484,6 +484,8 @@ substitutes for the final submission protocols above.
 Unless overridden in the table, these scripts default to Qwen-Coder-1.5B. Some
 historical sweeps have no environment-variable override for token counts or seeds;
 inspect the constants at the top of the script before changing their protocol.
+The historical HumanEval commands (`232` and `237`) evaluate all 164 programs
+with greedy decoding and the task's limit of 1024 new tokens per completion.
 
 T5 downstream exploration (SST-2 zero-shot; MNLI fine-tuning, separate from the
 submitted denoising grid). Expert counts follow `d_ff/32`, and checkpoint names

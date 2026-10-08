@@ -92,7 +92,7 @@ def gsizes(gl, dev):
     return gsz
 
 
-def main():
+def main() -> None:
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from datasets import load_dataset
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -105,6 +105,8 @@ def main():
             pass
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, trust_remote_code=True).to(dev).eval()
+    # HFLM supplies max_length from the task's generation budget.
+    model.generation_config.max_new_tokens = None
     model.config.use_cache = False
     layers = model.model.layers; nL = len(layers)
     gproj = [layers[li].mlp.gate_proj for li in range(nL)]
