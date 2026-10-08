@@ -378,6 +378,11 @@ for seed in 0 1 2; do
       2>&1 | tee "experiments/results/reproduction/quant-$bits-seed-$seed.log"
   done
 done
+HHMODEL=Qwen/Qwen2.5-Coder-1.5B SEED=0 KEEPS=0.50,0.25 \
+  NEVAL=1024 STEPS=3000 GREF=keep ORACLES_ONLY=1 CORR=0 \
+  OUT=experiments/results/reproduction/routing-oracles.json \
+  python -u experiments/252_routing_direct_metrics.py \
+  2>&1 | tee experiments/results/reproduction/routing-oracles.log
 HHMODEL=Qwen/Qwen2.5-Coder-1.5B NCALIB=8192 CHUNK=512 K=128 RFEAT=512 \
   KEEPS=0.50,0.25 TAUS=0.9,0.95,0.99 OUTDIR=experiments/results/reproduction \
   python -u experiments/252_effrank_profile.py \
@@ -387,7 +392,7 @@ HHMODEL=Qwen/Qwen2.5-Coder-1.5B KEEPS=0.50,0.25 \
   2>&1 | tee experiments/results/reproduction/behavior.log
 ```
 
-For oracle-only routing diagnostics set `ORACLES_ONLY=1 CORR=0` in `252`.
+The oracle-only `252` command uses `ORACLES_ONLY=1 CORR=0` and conversion seed 0.
 `233` includes SVD/random/reduced-rank-regression bases, MLP/ridge predictors,
 and true-coordinate references; keep50/25 are hardcoded. `228` fits 128
 coordinates, then truncates for its rank16/32/64/128 comparison. CPU calibration
@@ -408,23 +413,25 @@ for seed in 0 1 2; do
     OUT="experiments/results/reproduction/adaptive-$seed.json" \
     python -u experiments/211_router_sweep.py \
     2>&1 | tee "experiments/results/reproduction/adaptive-$seed.log"
+  HHMODEL=facebook/opt-1.3b SEED="$seed" NCALIB=8192 NEVAL=4096 KEEPS=0.50,0.25,0.10 \
+    OUT="experiments/results/reproduction/opt-representative-$seed.json" \
+    python -u experiments/214_opt_repzero.py \
+    2>&1 | tee "experiments/results/reproduction/opt-representative-$seed.log"
+done
+for seed in 0 1 2 3 4; do
   HHMODEL=Qwen/Qwen2.5-7B METRIC=superglue SEED="$seed" \
     SHARED=0,0.6 BUDGETS=fixed KEEPS=0.85 \
     NSTRUCT=8192 SWEEP=8192 NEVAL=4096 STEPS=3000 \
     OUT="experiments/results/reproduction/shared-$seed.json" \
     python -u experiments/211_router_sweep.py \
     2>&1 | tee "experiments/results/reproduction/shared-$seed.log"
-  HHMODEL=facebook/opt-1.3b SEED="$seed" NCALIB=8192 NEVAL=4096 KEEPS=0.50,0.25,0.10 \
-    OUT="experiments/results/reproduction/opt-representative-$seed.json" \
-    python -u experiments/214_opt_repzero.py \
-    2>&1 | tee "experiments/results/reproduction/opt-representative-$seed.log"
 done
 ```
 
 `211` adaptive evaluation starts after its 8192 structure and 8192 router-training
 tokens. Global allocation is a noncausal reference; deployable thresholds report
 actual retained fractions. Shared-expert scores average BoolQ, CB, COPA, RTE, WiC,
-and WSC; additional recorded seeds 3/4 can be run with the same command.
+and WSC; the command above runs all five recorded conversion seeds.
 `214` uses WikiText-2 test rather than MBPP, with `K=64`.
 
 Conversion cost and synthetic component latency:
