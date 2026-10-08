@@ -21,6 +21,7 @@ import sys, pathlib, gc, os, json, time, threading
 from collections import defaultdict
 from contextlib import contextmanager
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from experiments.reproducibility import load_mbpp_code
 import torch, torch.nn as nn, torch.nn.functional as F
 
 MODEL = os.environ.get("HHMODEL", "Qwen/Qwen2.5-Coder-1.5B")
@@ -118,19 +119,13 @@ class Meter:
         self.rss[name] = max(self.rss[name], self._peak, rss_bytes())
 
 
-def main():
+def main() -> None:
     from transformers import AutoTokenizer, AutoModelForCausalLM
-    from datasets import load_dataset
     dev = "cuda"
     M = Meter(); GB = 1024 ** 3
     t0 = time.perf_counter()
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    code = []
-    for sp in ["train", "test", "validation", "prompt"]:
-        try:
-            code += load_dataset("mbpp", split=sp, trust_remote_code=True)["code"]
-        except Exception:
-            pass
+    code = load_mbpp_code()
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, trust_remote_code=True).to(dev).eval()
     model.config.use_cache = False

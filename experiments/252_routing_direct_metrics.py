@@ -19,12 +19,16 @@ Env: GREF=keep regroup per keep (exp225, default) | GREF=0.5 fixed keep50 groupi
      (as exp230/253/254); runs before 2026-10-04 recomputed them in fp32 from x and used 2500 router steps.
      CORR=1 also trains a rank-128 correction on each selector's own selection error (exp230) and reports
      the FFN-output error AFTER correction ('<sel>+corr' rows: teacher-forced, in-situ, and ppl).
+     ORACLES_ONLY=1 evaluates only group/neuron oracles, with no router, PCA, or correction training.
+     SEED also controls grouping initialization, so separate seeds repeat the conversion.
 """
 from __future__ import annotations
 import sys, pathlib, gc, os, json
 from collections import defaultdict
+from typing import NotRequired, TypedDict
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch, torch.nn.functional as F
+from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 
 MODEL = os.environ.get("HHMODEL", "Qwen/Qwen2.5-Coder-1.5B")
 N_CALIB = 8192
@@ -37,10 +41,44 @@ STEPS = int(os.environ.get("STEPS", "3000"))
 SEED = int(os.environ.get("SEED", "0"))
 OUT = os.environ.get("OUT", "")
 CORR = os.environ.get("CORR", "0") == "1"
+ORACLES_ONLY = os.environ.get("ORACLES_ONLY", "0") == "1"
+if ORACLES_ONLY and CORR:
+    raise ValueError("ORACLES_ONLY requires CORR=0")
 RCORR = 128
-MAIN = ['oracle', 'gate', 'xrouter']
-SEL = MAIN + ['rn-oracle', 'static', 'random']              # group selectors
+MAIN = ['oracle'] if ORACLES_ONLY else ['oracle', 'gate', 'xrouter']
+SEL = MAIN if ORACLES_ONLY else MAIN + ['rn-oracle', 'static', 'random']
 ALL = SEL + ['neu-oracle']
+
+
+class GroupingState(TypedDict):
+    gf: torch.Tensor
+    gsz: torch.Tensor
+    gix: list[torch.Tensor]
+    router: torch.nn.Module | None
+    freq: dict[float, torch.Tensor]
+
+
+class CalibrationState(TypedDict):
+    a: torch.Tensor
+    Wd: torch.Tensor
+    vn: torch.Tensor
+    abar: torch.Tensor
+    x: NotRequired[torch.Tensor]
+    Wg: NotRequired[torch.Tensor]
+    Wu: NotRequired[torch.Tensor]
+    ebar: NotRequired[torch.Tensor]
+    xbar: NotRequired[torch.Tensor]
+    P: NotRequired[torch.Tensor]
+
+
+MetricResult = dict[str, float | None | dict[str, list[float]]]
+
+
+class KeepResults(TypedDict):
+    tf: dict[str, MetricResult]
+    insitu: dict[str, MetricResult]
+    pair_jaccard: dict[str, float]
+    pair_recall: dict[str, float]
 
 
 def weighted_kmeans_centroids(X, w, k, iters=20, seed=0):
@@ -119,7 +157,7 @@ def group_scores(mode, s, g, bf, dev_a, x, rgen):
     return torch.rand(dev_a.shape[0], K, device=dev_a.device, generator=rgen)
 
 
-def main():
+def main() -> None:
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from datasets import load_dataset
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -127,30 +165,38 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     code = []
     for sp in ["train", "test", "validation", "prompt"]:
-        try:
-            code += load_dataset("mbpp", split=sp, trust_remote_code=True)["code"]
-        except Exception:
-            pass
+        code += load_dataset("google-research-datasets/mbpp", "full", split=sp)["code"]
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
     assert len(ids) >= N_CALIB + N_EVAL and N_EVAL % CHUNK == 0, (len(ids), N_CALIB, N_EVAL)
-    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, trust_remote_code=True).to(dev).eval()
+    loaded = AutoModelForCausalLM.from_pretrained(
+        MODEL, dtype=torch.float16, trust_remote_code=True)
+    if not isinstance(loaded, Qwen2ForCausalLM):
+        raise ValueError("This evaluator requires a Qwen2 causal language model")
+    model = loaded
+    # The HF .to decorator loses its bound-method type; use the torch interface
+    # for this explicitly validated, non-quantized Qwen model.
+    torch.nn.Module.to(model, device=dev)
+    model.eval()
     model.config.use_cache = False
     layers = model.model.layers; nL = len(layers)
     gates = [layers[li].mlp.gate_proj for li in range(nL)]
     downs = [layers[li].mlp.down_proj for li in range(nL)]
-    print(f"  MODEL={MODEL} [SwiGLU] layers={nL} K={K} GREF={GREF} NEVAL={N_EVAL} STEPS={STEPS} SEED={SEED}", flush=True)
+    print(f"  MODEL={MODEL} [SwiGLU] layers={nL} K={K} GREF={GREF} NEVAL={N_EVAL} "
+          f"STEPS={STEPS} SEED={SEED} ORACLES_ONLY={ORACLES_ONLY}", flush=True)
     torch.set_grad_enabled(False)
     rgen = torch.Generator(device=dev).manual_seed(SEED)
 
-    STR = {}                                                # per-layer calibration statistics
-    GRP = {}                                                # keep -> layer -> grouping/router
+    STR: dict[int, CalibrationState] = {}
+    GRP: dict[float, dict[int, GroupingState]] = {}
     RUN = {'mode': None, 'bf': None, 'tf': False, 'c0': 0, 'corr': False}
     XC = {li: None for li in range(nL)}
-    CORRS = {}                                              # (keep, selector) -> layer -> (Br, pred)
+    CORRS: dict[tuple[float, str], dict[int, tuple[torch.Tensor, torch.nn.Module]]] = {}
     EHAT = {}
     DENSE_Y = {}                                            # (layer, chunk) -> dense FFN output
-    ACC = defaultdict(float)                                # (regime, keep, selector, layer, stat) -> sum
-    TOK = defaultdict(lambda: torch.zeros(N_EVAL, device=dev))  # per-token, summed over layers
+    ACC: defaultdict[tuple[str, float, str, int, str], torch.Tensor] = defaultdict(
+        lambda: torch.zeros((), dtype=torch.float64, device=dev))
+    TOK: defaultdict[tuple[str, float, str], torch.Tensor] = defaultdict(
+        lambda: torch.zeros(N_EVAL, device=dev))
 
     def add(regime, bf, m, li, **stats):
         for k, v in stats.items():
@@ -254,7 +300,8 @@ def main():
         return float(torch.tensor(tot / ntok).exp())
 
     # harvest FFN input x (gate input) and activation a (down_proj input) per layer on the calibration tokens
-    capx = {li: [] for li in range(nL)}; capa = {li: [] for li in range(nL)}
+    capx: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}
+    capa: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}
     hs = [gates[li].register_forward_pre_hook(
         (lambda li: (lambda _m, a: capx[li].append(a[0].reshape(-1, a[0].shape[-1]).half().cpu())))(li))
         for li in range(nL)]
@@ -266,33 +313,40 @@ def main():
     for h in hs:
         h.remove()
 
-    dff = None
+    dff: int = layers[0].mlp.down_proj.in_features
     for li in range(nL):
-        x = torch.cat(capx[li]).float().to(dev); capx[li] = None
-        a = torch.cat(capa[li]); capa[li] = None                 # fp16 activations as seen by the model
-        Wg = layers[li].mlp.gate_proj.weight.detach().float()
-        Wu = layers[li].mlp.up_proj.weight.detach().float()
+        x = torch.cat(capx[li]).float().to(dev); capx[li] = []
+        a = torch.cat(capa[li]); capa[li] = []                  # fp16 activations as seen by the model
         Wd = layers[li].mlp.down_proj.weight.detach().float()
-        dff = Wg.shape[0]
-        u = x @ Wu.T
-        xbar = x.mean(0); _, _, Vt = torch.linalg.svd(x - xbar, full_matrices=False)
-        STR[li] = dict(x=x.half().cpu(), a=a, Wg=Wg, Wu=Wu, Wd=Wd, vn=Wd.norm(dim=0), abar=a.float().to(dev).mean(0),
-                       ebar=u.abs().mean(0), xbar=xbar, P=Vt[:512].T)
-        del x, u, Vt; gc.collect(); torch.cuda.empty_cache()
-    print(f"  hidden={STR[0]['xbar'].shape[0]} dff={dff}", flush=True)
+        dff = a.shape[1]
+        STR[li] = dict(a=a, Wd=Wd, vn=Wd.norm(dim=0), abar=a.float().to(dev).mean(0))
+        if not ORACLES_ONLY:
+            Wg = layers[li].mlp.gate_proj.weight.detach().float()
+            Wu = layers[li].mlp.up_proj.weight.detach().float()
+            u = x @ Wu.T
+            xbar = x.mean(0); _, _, Vt = torch.linalg.svd(x - xbar, full_matrices=False)
+            STR[li].update({'x': x.half().cpu(), 'Wg': Wg, 'Wu': Wu,
+                            'ebar': u.abs().mean(0), 'xbar': xbar, 'P': Vt[:512].T})
+            del u, Vt
+        del x; gc.collect(); torch.cuda.empty_cache()
+    print(f"  dff={dff}", flush=True)
 
-    def build(li, bref):
+    def build(li: int, bref: float) -> GroupingState:
         """keep-pattern grouping at reference keep bref + x-router + static oracle-keep frequencies."""
-        s = STR[li]; x = s['x'].float().to(dev)
+        s = STR[li]
         a = s['a'].float().to(dev); dev_a = a - s['abar']; con = dev_a.abs() * s['vn']
         Bind = keep_topB_neuron(con, int(round(bref * dff))).float()
-        gf = balanced_assign(Bind.T.contiguous(), weighted_kmeans_centroids(Bind.T.contiguous(), con.mean(0), K, seed=0))
+        gf = balanced_assign(Bind.T.contiguous(), weighted_kmeans_centroids(Bind.T.contiguous(), con.mean(0), K, seed=SEED))
         gsz = torch.bincount(gf, minlength=K).float()
         gix = [(gf == g).nonzero().flatten() for g in range(K)]
-        router = mlp_fit((x - s['xbar']) @ s['P'], group_resnorm(dev_a, s['Wd'], gix), dev, steps=STEPS)
+        router: torch.nn.Module | None = None
+        if not ORACLES_ONLY:
+            x = s['x'].float().to(dev)
+            router = mlp_fit((x - s['xbar']) @ s['P'], group_resnorm(dev_a, s['Wd'], gix), dev, steps=STEPS)
+            del x
         sg = group_sum(con ** 2, gf, K)
         freq = {bf: select_groups(sg, gsz, int(round(bf * dff))).float().mean(0) for bf in KEEPS}
-        del x, a, dev_a, con, Bind, sg; gc.collect(); torch.cuda.empty_cache()
+        del a, dev_a, con, Bind, sg; gc.collect(); torch.cuda.empty_cache()
         return dict(gf=gf, gsz=gsz, gix=gix, router=router, freq=freq)
 
     built = {}
@@ -300,7 +354,8 @@ def main():
         bref = bf if GREF == "keep" else float(GREF)
         if bref not in built:
             built[bref] = {li: build(li, bref) for li in range(nL)}
-            print(f"  grouping=keep-pattern(ref keep{int(bref*100)}), x-router trained", flush=True)
+            print(f"  grouping=keep-pattern(ref keep{int(bref*100)}), seed={SEED}, "
+                  f"router trained={not ORACLES_ONLY}", flush=True)
         GRP[bf] = built[bref]
 
     def train_corr(li, bf, m):
@@ -325,9 +380,9 @@ def main():
         for m in (MAIN if CORR else []):
             PPL[f"{bf}|{m}+corr"] = ppl(m, bf, corr=True)
 
-    def layer_stats(regime, bf, m):
+    def layer_stats(regime: str, bf: float, m: str) -> dict[str, list[float]]:
         """per-layer means -> dict stat -> list over layers (nmse/accnmse = ratio of sums)."""
-        out = defaultdict(list)
+        out: defaultdict[str, list[float]] = defaultdict(list)
         for li in range(nL):
             st = {k[4]: float(v) for k, v in ACC.items() if k[:4] == (regime, bf, m, li)}
             if not st:
@@ -347,12 +402,15 @@ def main():
         t = TOK[key] / nL
         return 1.96 * float(t.std()) / N_EVAL ** 0.5
 
-    RES = dict(model=MODEL, K=K, gref=GREF, n_calib=N_CALIB, n_eval=N_EVAL, steps=STEPS, seed=SEED,
-               dff=dff, layers=nL, ppl=PPL, keeps={})
+    keep_results: dict[str, KeepResults] = {}
+    RES: dict[str, object] = dict(model=MODEL, K=K, gref=GREF, n_calib=N_CALIB, n_eval=N_EVAL,
+               steps=0 if ORACLES_ONLY else STEPS, seed=SEED, oracles_only=ORACLES_ONLY,
+               dff=dff, layers=nL, ppl=PPL, keeps=keep_results)
     print(f"\n  dense ppl {PPL['dense']:.3f}; keep-pattern K={K}, grp+mean; means over {nL} layers x {N_EVAL} "
           f"eval tokens (±95% CI over tokens)", flush=True)
     for bf in KEEPS:
-        R = RES['keeps'][f"{bf}"] = dict(tf={}, insitu={}, pair_jaccard={}, pair_recall={})
+        R: KeepResults = dict(tf={}, insitu={}, pair_jaccard={}, pair_recall={})
+        keep_results[f"{bf}"] = R
         ng = int(select_groups(GRP[bf][0]['freq'][bf][None], GRP[bf][0]['gsz'], int(round(bf * dff))).sum())
         print(f"\n  ===== keep{int(bf*100)} ({ng}/{K} groups kept per token) =====", flush=True)
         print("  [teacher-forced: all selectors on the same dense input; Jaccard/recall/mass vs group-oracle set]", flush=True)
@@ -360,13 +418,13 @@ def main():
               f"{'neuRecall':>9} | {'NMSE':>6} | {'relErr':>14} | {'cos':>6}", flush=True)
         for m in ALL + ['none'] + ([x + '+corr' for x in MAIN] if CORR else []):
             st = layer_stats('tf', bf, m); pr = layer_stats('tf', bf, f"{m}|oracle")
-            R['tf'][m] = dict(per_layer=dict(st, **pr), ppl=PPL.get(f"{bf}|{m}"),
-                              **{k: avg(v) for k, v in dict(st, **pr).items()})
-            r = R['tf'][m]
+            r = {k: avg(v) for k, v in dict(st, **pr).items()}
+            ppl_value = PPL.get(f"{bf}|{m}")
             if pr:
                 r['jac_ci95'] = ci(('jac', bf, m))
             r['rel_ci95'] = ci(('rel', bf, m))
-            p = f"{r['ppl']:>8.3f}" if r['ppl'] is not None else f"{'-':>8}"
+            R['tf'][m] = dict(per_layer=dict(st, **pr), ppl=ppl_value, **r)
+            p = f"{ppl_value:>8.3f}" if ppl_value is not None else f"{'-':>8}"
             jr = (f"{r['jac']:>6.3f} ±{r['jac_ci95']:.3f} | {r['rec']:>6.3f} | {r['mass']:>6.3f}" if pr
                   else f"{'-':>14} | {'-':>6} | {'-':>6}")
             print(f"  {m:>12} | {p} | {jr} | {r.get('nrec', float('nan')):>9.3f} | {r['nmse']:>6.3f} | "
@@ -386,16 +444,15 @@ def main():
               f"{'accNMSE':>7} | {'accRel':>6}", flush=True)
         for m in ALL + ([x + '+corr' for x in MAIN] if CORR else []):
             st = layer_stats('is', bf, m)
-            R['insitu'][m] = dict(per_layer=st, ppl=PPL[f"{bf}|{m}"], **{k: avg(v) for k, v in st.items()})
-            r = R['insitu'][m]
+            r = {k: avg(v) for k, v in st.items()}
+            R['insitu'][m] = dict(per_layer=st, ppl=PPL[f"{bf}|{m}"], **r)
             jr = f"{r['jac']:>7.3f} | {r['rec']:>6.3f}" if 'jac' in r else f"{'-':>7} | {'-':>6}"
-            print(f"  {m:>12} | {r['ppl']:>8.3f} | {jr} | {r['nmse']:>6.3f} | {r['rel']:>6.3f} | "
+            print(f"  {m:>12} | {PPL[f'{bf}|{m}']:>8.3f} | {jr} | {r['nmse']:>6.3f} | {r['rel']:>6.3f} | "
                   f"{r['accnmse']:>7.3f} | {r['accrel']:>6.3f}", flush=True)
-        print("  per-layer (teacher-forced): Jaccard vs oracle [gate, x-router] | NMSE [oracle, gate, x-router]", flush=True)
+        print(f"  per-layer (teacher-forced): NMSE {MAIN}", flush=True)
         for li in range(nL):
-            pl = {m: R['tf'][m]['per_layer'] for m in MAIN}
-            print(f"    L{li:<2} | {pl['gate']['jac'][li]:.3f} {pl['xrouter']['jac'][li]:.3f} | "
-                  f"{pl['oracle']['nmse'][li]:.3f} {pl['gate']['nmse'][li]:.3f} {pl['xrouter']['nmse'][li]:.3f}", flush=True)
+            pl = {m: layer_stats('tf', bf, m) for m in MAIN}
+            print(f"    L{li:<2} | " + " ".join(f"{pl[m]['nmse'][li]:.3f}" for m in MAIN), flush=True)
     if OUT:
         pathlib.Path(OUT).parent.mkdir(parents=True, exist_ok=True)
         pathlib.Path(OUT).write_text(json.dumps(RES, indent=1))

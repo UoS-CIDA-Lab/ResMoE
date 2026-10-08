@@ -64,6 +64,8 @@ mple_java/Problem*
 
 # --- keep only paper-reproducing experiments (exclude exploratory 01-207 etc.) ---
 experiments/*
+!experiments/baseline_grouping.py
+!experiments/reproducibility.py
 !experiments/208_*.py
 !experiments/211_*.py
 !experiments/214_*.py
@@ -97,6 +99,9 @@ experiments/*
 !experiments/246_*.py
 !experiments/247_*.py
 !experiments/248_*.py
+!experiments/tests/
+experiments/tests/*
+!experiments/tests/test_mbert_grouping.py
 !experiments/249_*.py
 !experiments/251_*.py
 !experiments/252_*.py

@@ -18,11 +18,50 @@ the realized kept fraction is reported. The correction is trained on each select
 ppl is reported on the first 1024 eval tokens (paper protocol) and on all NEVAL tokens.
 Run: HHMODEL=Qwen/Qwen2.5-Coder-1.5B python3 experiments/254_matched_compute_xrouter.py
 Env: KEEPS (0.50,0.25), NEVAL (32768), SEED (router / correction MLP init + batches), OUT=json path.
+SCOPE=baseline evaluates only the input-weight baseline at both budgets; it does not fit correction
+or selection-pattern grouping. GROUPING_SEED=0 matches upstream; GROUPING_DIR reuses validated groups.
+SCOPE=pattern_more evaluates only keep-pattern grouping rebuilt at f+corr_frac, with a newly fitted
+x-router. It does not run the weight baseline, the nominal-keep grouping, or correction fitting.
+Input-weight rows are L2-normalized and grouped with upstream KMeansConstrained defaults.
+The shared contribution-based oracle and PCA/GeLU x-router are our controlled selector protocol,
+not the published G-MoEfication selector. Model weights and calibration means remain unchanged.
 """
 from __future__ import annotations
-import sys, pathlib, gc, os, json
+import sys, pathlib, gc, os, json, hashlib, time
+from enum import Enum
+from typing import TypedDict
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch, torch.nn as nn, torch.nn.functional as F
+from experiments.baseline_grouping import GROUPING_REFERENCE, gmoe_weight_groups
+from experiments.reproducibility import configure_determinism, report_provenance
+
+
+class Scope(Enum):
+    ALL = "all"
+    BASELINE = "baseline"
+    PATTERN_MORE = "pattern_more"
+
+
+class Grouping(Enum):
+    WEIGHT = "w"
+    PATTERN = "kp"
+
+
+class LayerStats(TypedDict):
+    a: torch.Tensor
+    x: torch.Tensor
+    Wd: torch.Tensor
+    abar: torch.Tensor
+    vn: torch.Tensor
+    xbar: torch.Tensor
+    P: torch.Tensor
+
+
+class GroupStats(TypedDict):
+    gf: torch.Tensor
+    gsz: torch.Tensor
+    selr: nn.Sequential
 
 MODEL = os.environ.get("HHMODEL", "Qwen/Qwen2.5-Coder-1.5B")
 N_CALIB = 8192
@@ -34,23 +73,14 @@ RFEAT = 512
 HID = 512
 KEEPS = [float(k) for k in os.environ.get("KEEPS", "0.50,0.25").split(",")]
 SEED = int(os.environ.get("SEED", "0"))
+GROUPING_SEED = int(os.environ.get("GROUPING_SEED", "0"))
+SCOPE = Scope(os.environ.get("SCOPE", "all"))
+GROUPING_DIR = pathlib.Path(os.environ["GROUPING_DIR"]) if "GROUPING_DIR" in os.environ else None
 OUT = os.environ.get("OUT", "")
 SELS = ['oracle', 'xrouter']
 ROWS = [('gmoe', "G-MoE grouping (weight k-means + mean)"), ('gmoe_more', "G-MoE grouping, more neurons"),
         ('kp', "keep-pattern grouping"), ('kp_more', "keep-pattern grouping, more neurons"),
         ('kp_more_same', "keep-pattern, more neurons (same grouping+router)"), ('kp_corr', f"keep-pattern + rank-{RCORR} correction (ResMoE)")]
-
-
-def kmeans_centroids(X, k, iters=20, seed=0):
-    g = torch.Generator(device=X.device).manual_seed(seed)
-    c = X[torch.randperm(X.shape[0], generator=g, device=X.device)[:k]].clone()
-    for _ in range(iters):
-        a = torch.cdist(X, c).argmin(1)
-        for j in range(k):
-            m = a == j
-            if m.any():
-                c[j] = X[m].mean(0)
-    return c
 
 
 def weighted_kmeans_centroids(X, w, k, iters=20, seed=0):
@@ -111,18 +141,18 @@ def sel_mask(sel, a, z, s, g, B):
     return keep_topB_group(sg, g['gsz'], g['gf'], B)
 
 
-def main():
+def main() -> None:
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from datasets import load_dataset
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.manual_seed(SEED)
+    configure_determinism(SEED)
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     code = []
+    fingerprints: dict[str, str] = {}
     for sp in ["train", "test", "validation", "prompt"]:
-        try:
-            code += load_dataset("mbpp", split=sp, trust_remote_code=True)["code"]
-        except Exception:
-            pass
+        dataset = load_dataset("google-research-datasets/mbpp", "full", split=sp)
+        code += dataset["code"]
+        fingerprints[sp] = dataset._fingerprint
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
     assert len(ids) >= N_CALIB + N_EVAL and N_EVAL % CHUNK == 0 and N_EVAL >= 1024, (len(ids), N_EVAL)
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, trust_remote_code=True).to(dev).eval()
@@ -132,7 +162,7 @@ def main():
     downs = [layers[li].mlp.down_proj for li in range(nL)]
     torch.set_grad_enabled(False)
 
-    STR = {}
+    STR: dict[int, LayerStats] = {}
     RUN = dict(sel=None, G=None, B=0, corr=None, neuron=False, kept=[0.0, 0], err2=None, y2=None)
     XC = {li: None for li in range(nL)}
     EHAT = {}
@@ -210,13 +240,18 @@ def main():
     print(f"  MODEL={MODEL} dff={dff} hidden={hidden} K={K} SEED={SEED} NEVAL={N_EVAL} | corr_frac(r{RCORR})="
           f"{corr_frac*100:.2f}% FFN | dense ppl {dense[0]:.3f} (1024) {dense[1]:.3f} (all)", flush=True)
 
-    def build(li, kind, bf=None):
-        """grouping (kind: 'kp' keep-pattern at keep bf | 'w' G-MoE weight k-means) + its x-router."""
+    def build(li: int, kind: Grouping, bf: float | None = None) -> GroupStats:
+        """Grouping plus its x-router; input-weight grouping is independent of keep."""
         s = STR[li]; a = s['a'].float().to(dev); dev_a = a - s['abar']
-        if kind == 'w':
+        started = time.monotonic()
+        print(f"  layer {li + 1}/{nL}: grouping {kind.value}", flush=True)
+        if kind is Grouping.WEIGHT:
             Wg = gproj[li].weight.detach().float()
-            gf = balanced_assign(Wg, kmeans_centroids(Wg, K, seed=0))
+            cache = GROUPING_DIR / f"layer_{li:02d}.pt" if GROUPING_DIR is not None else None
+            _, gf = gmoe_weight_groups(Wg, K, dev, seed=GROUPING_SEED, cache_path=cache)
         else:
+            if bf is None:
+                raise ValueError("Selection-pattern grouping requires a keep fraction")
             con = dev_a.abs() * s['vn']
             Bind = keep_topB_neuron(con, int(round(bf * dff))).float()
             gf = balanced_assign(Bind.T.contiguous(), weighted_kmeans_centroids(Bind.T.contiguous(), con.mean(0), K, seed=0))
@@ -227,6 +262,7 @@ def main():
             if len(ix):
                 rn[:, g] = (dev_a[:, ix] @ s['Wd'][:, ix].T).norm(dim=1)
         selr = mlp_fit((s['x'].float().to(dev) - s['xbar']) @ s['P'], rn, dev)
+        print(f"  layer {li + 1}/{nL}: grouping/router done in {time.monotonic() - started:.1f}s", flush=True)
         del a, dev_a, rn; gc.collect(); torch.cuda.empty_cache()
         return dict(gf=gf, gsz=torch.bincount(gf, minlength=K).float(), selr=selr)
 
@@ -240,23 +276,63 @@ def main():
         del a, z, m, E, Vt; gc.collect(); torch.cuda.empty_cache()
         return Br, pred
 
-    GW = {li: build(li, 'w') for li in range(nL)}           # weight grouping / its router do not depend on keep
+    report_provenance(source=__file__, model=MODEL, revision=model.config._commit_hash,
+                      seed=SEED, tokens=ids, fingerprints=fingerprints,
+                      calibration_items=N_CALIB, evaluation_items=N_EVAL, chunk=CHUNK)
+    GW = {li: build(li, Grouping.WEIGHT) for li in range(nL)} if SCOPE is not Scope.PATTERN_MORE else {}
     RES = dict(model=MODEL, K=K, rcorr=RCORR, seed=SEED, n_calib=N_CALIB, n_eval=N_EVAL, dff=dff,
-               corr_frac=corr_frac, dense=dense[:2], keeps={})
+               corr_frac=corr_frac, dense=dense[:2], keeps={}, scope=SCOPE.value,
+               grouping_seed=GROUPING_SEED, grouping_reference=GROUPING_REFERENCE,
+               grouping_source_sha256=hashlib.sha256(pathlib.Path(gmoe_weight_groups.__code__.co_filename).read_bytes()).hexdigest(),
+               model_revision=model.config._commit_hash, corpus_fingerprints=fingerprints,
+               tokens_sha256=hashlib.sha256(ids.numpy().tobytes()).hexdigest(),
+               source_sha256=hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(),
+               physical_gpus=os.environ.get("CUDA_VISIBLE_DEVICES"),
+               deterministic_algorithms=torch.are_deterministic_algorithms_enabled())
+    if SCOPE is Scope.PATTERN_MORE:
+        RES['pattern_protocol'] = dict(grouping_seed=0, kmeans_iterations=20,
+                                       assignment="greedy_balanced", router_seed=SEED,
+                                       router_initialization="independent pattern_more scope; layers in ascending order",
+                                       preceding_router_fits=0,
+                                       router_steps=3000, router_batch=2048,
+                                       router_learning_rate=3e-3, router_features=RFEAT,
+                                       router_hidden=HID,
+                                       calibration_sha256=hashlib.sha256(ids[:N_CALIB].numpy().tobytes()).hexdigest())
     for bf in KEEPS:
         bf2 = bf + corr_frac
-        GP = {li: build(li, 'kp', bf) for li in range(nL)}
-        GP2 = {li: build(li, 'kp', bf2) for li in range(nL)}
-        R = RES['keeps'][f"{bf}"] = {'neu-oracle': ppl('oracle', GP, bf, neuron=True)}
-        print(f"\n  ===== keep{int(bf*100)}  (f={bf:.4f}, matched cost f+corr={bf2:.4f}) | dense {dense[1]:.3f} | "
-              f"neu-oracle {R['neu-oracle'][1]:.3f} =====", flush=True)
-        print(f"  {'configuration':<50} | {'cost':>6} | " + " | ".join(
-            f"{s + ' 1024':>13} {s + ' all':>12} {'kept':>6} {'NMSE':>6}" for s in SELS), flush=True)
+        R = RES['keeps'][f"{bf}"] = {}
+        if SCOPE is Scope.ALL:
+            GP = {li: build(li, Grouping.PATTERN, bf) for li in range(nL)}
+        if SCOPE is not Scope.BASELINE:
+            GP2 = {li: build(li, Grouping.PATTERN, bf2) for li in range(nL)}
+        if SCOPE is Scope.PATTERN_MORE:
+            RES['pattern_protocol']['nominal_keep'] = bf
+            RES['pattern_protocol']['matched_keep_target'] = bf2
+            RES['pattern_protocol']['neuron_budget'] = int(round(bf2 * dff))
+            RES['pattern_protocol']['group_sizes'] = {str(li): GP2[li]['gsz'].cpu().tolist() for li in range(nL)}
+            RES['pattern_protocol']['group_labels_sha256'] = {
+                str(li): hashlib.sha256(GP2[li]['gf'].cpu().numpy().tobytes()).hexdigest() for li in range(nL)}
+        if SCOPE is Scope.ALL:
+            R['neu-oracle'] = ppl('oracle', GP, bf, neuron=True)
         for sel in SELS:
-            CORR = {li: train_corr(li, bf, GP[li], sel) for li in range(nL)}
-            R[sel] = dict(gmoe=ppl(sel, GW, bf), gmoe_more=ppl(sel, GW, bf2), kp=ppl(sel, GP, bf),
-                          kp_more=ppl(sel, GP2, bf2), kp_more_same=ppl(sel, GP, bf2), kp_corr=ppl(sel, GP, bf, corr=CORR))
-            del CORR; gc.collect(); torch.cuda.empty_cache()
+            if SCOPE is Scope.PATTERN_MORE:
+                R[sel] = dict(kp_more=ppl(sel, GP2, bf2))
+            else:
+                R[sel] = dict(gmoe=ppl(sel, GW, bf), gmoe_more=ppl(sel, GW, bf2))
+            if SCOPE is Scope.ALL:
+                CORR = {li: train_corr(li, bf, GP[li], sel) for li in range(nL)}
+                R[sel].update(kp=ppl(sel, GP, bf), kp_more=ppl(sel, GP2, bf2),
+                              kp_more_same=ppl(sel, GP, bf2), kp_corr=ppl(sel, GP, bf, corr=CORR))
+                del CORR; gc.collect(); torch.cuda.empty_cache()
+            print(json.dumps(dict(record="measurement", seed=SEED, keep=bf,
+                                  selector=sel, **R[sel])), flush=True)
+        if OUT:
+            pathlib.Path(OUT).parent.mkdir(parents=True, exist_ok=True)
+            pathlib.Path(OUT).write_text(json.dumps(RES, indent=1))
+        if SCOPE is not Scope.ALL:
+            if SCOPE is Scope.PATTERN_MORE:
+                del GP2; gc.collect(); torch.cuda.empty_cache()
+            continue
         for key, name in ROWS:
             cost = "f" if key in ('gmoe', 'kp') else "f+corr"
             print(f"  {name:<50} | {cost:>6} | " + " | ".join(

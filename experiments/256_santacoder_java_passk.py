@@ -21,7 +21,9 @@ from __future__ import annotations
 import sys, pathlib, gc, os, types, math, json, subprocess, tempfile
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from experiments.reproducibility import load_mbpp_code
 import torch, torch.nn as nn, torch.nn.functional as F
+from mple_java.runtime import require_java_environment
 
 MODEL = os.environ.get("HHMODEL", str(pathlib.Path(__file__).resolve().parents[1] / "ckpts" / "santacoder-java"))
 N_CALIB = int(os.environ.get("NCALIB", "8192"))
@@ -174,12 +176,13 @@ def passk_stats(correct, n):
     return out
 
 
-def main():
+def main() -> None:
+    require_java_environment(pathlib.Path(JAR))
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from datasets import load_dataset
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    code = []
+    code: list[str] = []
     if CALIB == "java":                                     # Java blocks of the fine-tuning corpus (as exp251)
         import re
         java_re = re.compile(r"```java\s*(.*?)```", re.DOTALL | re.IGNORECASE)
@@ -188,11 +191,7 @@ def main():
             if len(code) >= 400:
                 break
     else:
-        for sp in ["train", "test", "validation", "prompt"]:
-            try:
-                code += load_dataset("mbpp", split=sp, trust_remote_code=True)["code"]
-            except Exception:
-                pass
+        code = load_mbpp_code()
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
     assert len(ids) >= N_CALIB + N_EVAL + N_VAL, len(ids)
     problems = load_dataset('nuprl/MultiPL-E', 'humaneval-java', split='test')

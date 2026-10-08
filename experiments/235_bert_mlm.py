@@ -10,7 +10,11 @@ Run: HHMODEL=bert-base-multilingual-cased python3 experiments/235_bert_mlm.py
 from __future__ import annotations
 import sys, pathlib, gc, os
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from experiments.reproducibility import configure_determinism, report_provenance, report_metrics
 import torch, torch.nn as nn, torch.nn.functional as F
+
+SEED = int(os.environ.get("SEED", "0"))
+configure_determinism(SEED)
 
 MODEL = os.environ.get("HHMODEL", "bert-base-multilingual-cased")
 SEQ = 128
@@ -48,10 +52,14 @@ def balanced_assign(X, centroids):
     return torch.tensor(assign, device=X.device, dtype=torch.long)
 
 
-def mlp_fit(X, Y, dev, steps=3000, hidden=512, lr=3e-3, bs=2048):
+def mlp_fit(
+    X: torch.Tensor, Y: torch.Tensor, dev: str, steps: int = 3000,
+    hidden: int = 512, lr: float = 3e-3, bs: int = 2048,
+) -> nn.Sequential:
+    torch.manual_seed(SEED)
     net = nn.Sequential(nn.Linear(X.shape[1], hidden), nn.GELU(), nn.Linear(hidden, Y.shape[1])).to(dev).float()
     opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
-    gen = torch.Generator(device=dev).manual_seed(0)
+    gen = torch.Generator(device=dev).manual_seed(SEED)
     with torch.enable_grad():
         for _ in range(steps):
             bi = torch.randint(0, X.shape[0], (bs,), generator=gen, device=dev)
@@ -78,17 +86,17 @@ def oracle_mask(a, abar, vn, gsz, gf, B):
     return keep_topB_group(sg, gsz, gf, B).to(a.dtype)
 
 
-def main():
+def main() -> None:
     from transformers import AutoTokenizer, AutoModelForMaskedLM
     from datasets import load_dataset
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    text = []
+    text: list[str] = []
+    fingerprints: dict[str, str] = {}
     for sp in ["train", "test", "validation", "prompt"]:
-        try:
-            text += load_dataset("google-research-datasets/mbpp", "full", split=sp)["code"]
-        except Exception:
-            pass
+        dataset = load_dataset("google-research-datasets/mbpp", "full", split=sp)
+        fingerprints[sp] = dataset._fingerprint
+        text.extend(dataset["code"])
     ids = tok("\n\n".join(text), return_tensors="pt", add_special_tokens=False).input_ids[0]
     nseg_total = ids.shape[0] // SEQ
     segs = ids[:nseg_total * SEQ].reshape(nseg_total, SEQ)
@@ -98,6 +106,9 @@ def main():
     outproj = [enc[li].output.dense for li in range(nL)]
     mask_id = tok.mask_token_id
     torch.set_grad_enabled(False)
+    report_provenance(source=__file__, model=MODEL, revision=model.config._commit_hash,
+                      seed=SEED, tokens=ids, fingerprints=fingerprints,
+                      calibration_items=N_CALIB_SEG, evaluation_items=N_EVAL_SEG, chunk=SEQ)
 
     CFG = {li: {'active': False} for li in range(nL)}
     XC = {li: None for li in range(nL)}
@@ -145,7 +156,7 @@ def main():
         return xin, labels
 
     # ---- harvest (masked, to match eval distribution) ----
-    capa = {li: [] for li in range(nL)}; capx = {li: [] for li in range(nL)}
+    capa: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}; capx: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}
     hs = []
     for li in range(nL):
         hs.append(outproj[li].register_forward_pre_hook(
@@ -178,15 +189,15 @@ def main():
         af = a.float().to(dev); vn = Wd.norm(dim=0); abar = af.mean(0)
         xbar = x.mean(0); _, _, VtX = torch.linalg.svd(x - xbar, full_matrices=False)
         STR[li] = dict(a=a, x=x.half().cpu(), abar=abar, vn=vn, Wd=Wd.cpu(), xbar=xbar, P=VtX[:RFEAT].T)
-        capa[li] = None; capx[li] = None
+        del capa[li], capx[li]
         del af, x, Wd; gc.collect(); torch.cuda.empty_cache()
     print(f"  MODEL={MODEL} dff={dff} nL={nL} act={getattr(model.config,'hidden_act','?')} (encoder MLM)", flush=True)
 
-    def grouping(li, bf):
+    def grouping(li: int, bf: float) -> tuple[torch.Tensor, torch.Tensor]:
         s = STR[li]; a = s['a'].float().to(dev); vn = s['vn']; abar = s['abar']; B = int(round(bf * dff))
         Bind = keep_topB_neuron((a - abar).abs() * vn, B).float()
         w = ((a - abar).abs() * vn).mean(0)
-        gl = balanced_assign(Bind.T.contiguous(), weighted_kmeans_centroids(Bind.T.contiguous(), w, K, seed=0))
+        gl = balanced_assign(Bind.T.contiguous(), weighted_kmeans_centroids(Bind.T.contiguous(), w, K, seed=SEED))
         gsz = torch.zeros(K, device=dev)
         for g in range(K):
             gsz[g] = (gl == g).sum()
@@ -221,17 +232,19 @@ def main():
             CFG[li]['active'] = False; CFG[li]['corr'] = False; CFG[li]['neuron'] = False
 
     RANKS = [int(x) for x in os.environ.get("RANKS", "").split(",") if x.strip()]
-    dense = mlm_eval(); print(f"  dense MLM-ppl {dense:.3f}\n", flush=True)
+    dense = mlm_eval(); report_metrics(dict(seed=SEED, configuration="dense", ppl=dense)); print(f"  dense MLM-ppl {dense:.3f}\n", flush=True)
     for bf in KEEPS:
         GRP = {li: grouping(li, bf) for li in range(nL)}
         setcfg(bf, GRP, 'group'); floor = mlm_eval(); off()
         setcfg(bf, GRP, 'neuron'); neu = mlm_eval(); off()
+        report_metrics(dict(seed=SEED, keep=bf, dense=dense, group_oracle=floor, neuron_oracle=neu))
         if RANKS:
             for r in RANKS:
                 BR = {}; PRED = {}
                 for li in range(nL):
                     BR[li], PRED[li] = basis_and_pred(li, bf, *GRP[li], r=r)
                 setcfg(bf, GRP, 'corr', BR, PRED); cr = mlm_eval(); off()
+                report_metrics(dict(seed=SEED, keep=bf, rank=r, predicted_coordinates=cr))
                 print(f"  keep{int(bf*100)} rank{r}: +pred-corr {cr:.3f}  [dense {dense:.3f} | floor {floor:.3f} | ceiling {neu:.3f}]", flush=True)
             continue
         BR = {}; PRED = {}

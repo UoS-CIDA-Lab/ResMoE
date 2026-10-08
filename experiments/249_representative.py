@@ -8,7 +8,11 @@ Run: python3 experiments/249_representative.py
 from __future__ import annotations
 import sys, pathlib, gc, os
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from experiments.reproducibility import configure_determinism, report_provenance, report_metrics
 import torch, torch.nn as nn, torch.nn.functional as F
+
+SEED = int(os.environ.get("SEED", "0"))
+configure_determinism(SEED)
 
 MODEL = os.environ.get("HHMODEL", "Qwen/Qwen2.5-Coder-1.5B")
 N_CALIB = 8192; CHUNK = 512; N_EVAL = 1024
@@ -41,10 +45,14 @@ def balanced_assign(X, centroids):
     return torch.tensor(assign, device=X.device, dtype=torch.long)
 
 
-def mlp_fit(X, Y, dev, steps=3000, hidden=512, lr=3e-3, bs=2048):
+def mlp_fit(
+    X: torch.Tensor, Y: torch.Tensor, dev: str, steps: int = 3000,
+    hidden: int = 512, lr: float = 3e-3, bs: int = 2048,
+) -> nn.Sequential:
+    torch.manual_seed(SEED)
     net = nn.Sequential(nn.Linear(X.shape[1], hidden), nn.GELU(), nn.Linear(hidden, Y.shape[1])).to(dev).float()
     opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
-    gen = torch.Generator(device=dev).manual_seed(0)
+    gen = torch.Generator(device=dev).manual_seed(SEED)
     with torch.enable_grad():
         for _ in range(steps):
             bi = torch.randint(0, X.shape[0], (bs,), generator=gen, device=dev)
@@ -71,17 +79,17 @@ def oracle_mask(a, abar, vn, gsz, gf, B):
     return keep_topB_group(sg, gsz, gf, B).to(a.dtype)
 
 
-def main():
+def main() -> None:
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from datasets import load_dataset
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    code = []
+    code: list[str] = []
+    fingerprints: dict[str, str] = {}
     for sp in ["train", "test", "validation", "prompt"]:
-        try:
-            code += load_dataset("google-research-datasets/mbpp", "full", split=sp)["code"]
-        except Exception:
-            pass
+        dataset = load_dataset("google-research-datasets/mbpp", "full", split=sp)
+        fingerprints[sp] = dataset._fingerprint
+        code.extend(dataset["code"])
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, trust_remote_code=True).to(dev).eval()
     model.config.use_cache = False
@@ -89,6 +97,9 @@ def main():
     gproj = [layers[li].mlp.gate_proj for li in range(nL)]
     downs = [layers[li].mlp.down_proj for li in range(nL)]
     torch.set_grad_enabled(False)
+    report_provenance(source=__file__, model=MODEL, revision=model.config._commit_hash,
+                      seed=SEED, tokens=ids, fingerprints=fingerprints,
+                      calibration_items=N_CALIB, evaluation_items=N_EVAL, chunk=CHUNK)
     CFG = {li: {'active': False} for li in range(nL)}; XC = {li: None for li in range(nL)}
 
     def gpre(li):
@@ -122,7 +133,7 @@ def main():
         downs[li].register_forward_pre_hook(dpre(li))
         downs[li].register_forward_hook(dpost(li))
 
-    capa = {li: [] for li in range(nL)}; capx = {li: [] for li in range(nL)}; hs = []
+    capa: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}; capx: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}; hs = []
     for li in range(nL):
         hs.append(downs[li].register_forward_pre_hook(
             (lambda li: (lambda _m, a: capa[li].append(a[0].reshape(-1, a[0].shape[-1]).half().cpu())))(li)))
@@ -149,7 +160,7 @@ def main():
         vn = Wd.norm(dim=0); abar = a.mean(0)
         xbar = x.mean(0); _, _, VtX = torch.linalg.svd(x - xbar, full_matrices=False)
         STR[li] = dict(a=a.half().cpu(), x=x.half().cpu(), abar=abar, vn=vn, Wd=Wd.cpu(), xbar=xbar, P=VtX[:RFEAT].T)
-        capa[li] = None; capx[li] = None; del a, x, Wd; gc.collect(); torch.cuda.empty_cache()
+        del capa[li], capx[li]; del a, x, Wd; gc.collect(); torch.cuda.empty_cache()
     print(f"  MODEL={MODEL} dff={dff} (representative ablation)", flush=True)
 
     def build(bf):
@@ -158,7 +169,7 @@ def main():
             s = STR[li]; a = s['a'].float().to(dev); abar = s['abar']; vn = s['vn']; Wd = s['Wd'].to(dev)
             Bind = keep_topB_neuron((a - abar).abs() * vn, B).float()
             w = ((a - abar).abs() * vn).mean(0)
-            gl = balanced_assign(Bind.T.contiguous(), weighted_kmeans_centroids(Bind.T.contiguous(), w, K, seed=0))
+            gl = balanced_assign(Bind.T.contiguous(), weighted_kmeans_centroids(Bind.T.contiguous(), w, K, seed=SEED))
             gsz = torch.zeros(K, device=dev)
             for g in range(K):
                 gsz[g] = (gl == g).sum()
@@ -186,6 +197,7 @@ def main():
             CFG[li]['active'] = False; CFG[li]['corr'] = False
 
     off(); dense = ce_eval()
+    report_metrics(dict(seed=SEED, configuration="dense", ppl=dense))
     print(f"  dense ppl {dense:.3f}\n", flush=True)
     for bf in KEEPS:
         G, B = build(bf)
@@ -193,6 +205,8 @@ def main():
         setcfg(G, B, 'mean'); mn = ce_eval(); off()
         setcfg(G, B, 'cond'); cm = ce_eval(); off()
         setcfg(G, B, 'mean', corr=True); cr = ce_eval(); off()
+        report_metrics(dict(seed=SEED, keep=bf, dense=dense, zero=z,
+                            mean=mn, conditional_mean=cm, corrected=cr))
         print(f"  keep{int(bf*100)} representative: zero {z:.3f} | mean(rank0,G-MoE) {mn:.3f} | "
               f"cond-mean {cm:.3f} | +corr(rank{RCORR}) {cr:.3f}  [dense {dense:.3f}]", flush=True)
     print("\nREAD: isolates process-3 (representative). zero<mean<cond-mean<+corr expected; the rank-r", flush=True)

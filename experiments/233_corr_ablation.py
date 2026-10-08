@@ -12,7 +12,11 @@ Run: HHMODEL=Qwen/Qwen2.5-Coder-1.5B python3 experiments/233_corr_ablation.py
 from __future__ import annotations
 import sys, pathlib, gc, os
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from experiments.reproducibility import configure_determinism, report_provenance, report_metrics
 import torch, torch.nn as nn, torch.nn.functional as F
+
+SEED = int(os.environ.get("SEED", "0"))
+configure_determinism(SEED)
 
 MODEL = os.environ.get("HHMODEL", "Qwen/Qwen2.5-Coder-1.5B")
 N_CALIB = int(os.environ.get("NCALIB", "8192"))
@@ -49,10 +53,14 @@ def balanced_assign(X, centroids):
     return torch.tensor(assign, device=X.device, dtype=torch.long)
 
 
-def mlp_fit(X, Y, dev, steps=3000, hidden=512, lr=3e-3, bs=2048):
+def mlp_fit(
+    X: torch.Tensor, Y: torch.Tensor, dev: str, steps: int = 3000,
+    hidden: int = 512, lr: float = 3e-3, bs: int = 2048,
+) -> nn.Sequential:
+    torch.manual_seed(SEED)
     net = nn.Sequential(nn.Linear(X.shape[1], hidden), nn.GELU(), nn.Linear(hidden, Y.shape[1])).to(dev).float()
     opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
-    gen = torch.Generator(device=dev).manual_seed(0)
+    gen = torch.Generator(device=dev).manual_seed(SEED)
     with torch.enable_grad():
         for _ in range(steps):
             bi = torch.randint(0, X.shape[0], (bs,), generator=gen, device=dev)
@@ -86,17 +94,17 @@ def oracle_mask(a, abar, vn, gsz, gf, B):
     return keep_topB_group(sg, gsz, gf, B).to(a.dtype)
 
 
-def main():
+def main() -> None:
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from datasets import load_dataset
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    code = []
+    code: list[str] = []
+    fingerprints: dict[str, str] = {}
     for sp in ["train", "test", "validation", "prompt"]:
-        try:
-            code += load_dataset("google-research-datasets/mbpp", "full", split=sp)["code"]
-        except Exception:
-            pass
+        dataset = load_dataset("google-research-datasets/mbpp", "full", split=sp)
+        fingerprints[sp] = dataset._fingerprint
+        code.extend(dataset["code"])
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, trust_remote_code=True).to(dev).eval()
     model.config.use_cache = False
@@ -104,6 +112,9 @@ def main():
     gproj = [layers[li].mlp.gate_proj for li in range(nL)]
     downs = [layers[li].mlp.down_proj for li in range(nL)]
     torch.set_grad_enabled(False)
+    report_provenance(source=__file__, model=MODEL, revision=model.config._commit_hash,
+                      seed=SEED, tokens=ids, fingerprints=fingerprints,
+                      calibration_items=N_CALIB, evaluation_items=N_EVAL, chunk=CHUNK)
 
     CFG = {li: {'active': False} for li in range(nL)}
     XC = {li: None for li in range(nL)}; STASH = {li: None for li in range(nL)}
@@ -149,7 +160,7 @@ def main():
         downs[li].register_forward_hook(dpost(li))
 
     # ---- harvest ----
-    capa = {li: [] for li in range(nL)}; capx = {li: [] for li in range(nL)}
+    capa: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}; capx: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}
     hs = []
     for li in range(nL):
         hs.append(downs[li].register_forward_pre_hook(
@@ -179,15 +190,15 @@ def main():
         af = a.float().to(dev); vn = Wd.norm(dim=0); abar = af.mean(0)
         xbar = x.mean(0); _, _, VtX = torch.linalg.svd(x - xbar, full_matrices=False)
         STR[li] = dict(a=a, x=x.half().cpu(), abar=abar, vn=vn, Wd=Wd.cpu(), xbar=xbar, P=VtX[:RFEAT].T)
-        capa[li] = None; capx[li] = None
+        del capa[li], capx[li]
         del af, x, Wd; gc.collect(); torch.cuda.empty_cache()
     print(f"  MODEL={MODEL} dff={dff} N_CALIB={N_CALIB}", flush=True)
 
-    def grouping(li, bf):
+    def grouping(li: int, bf: float) -> tuple[torch.Tensor, torch.Tensor]:
         s = STR[li]; a = s['a'].float().to(dev); vn = s['vn']; abar = s['abar']; B = int(round(bf * dff))
         Bind = keep_topB_neuron((a - abar).abs() * vn, B).float()
         w = ((a - abar).abs() * vn).mean(0)
-        gl = balanced_assign(Bind.T.contiguous(), weighted_kmeans_centroids(Bind.T.contiguous(), w, K, seed=0))
+        gl = balanced_assign(Bind.T.contiguous(), weighted_kmeans_centroids(Bind.T.contiguous(), w, K, seed=SEED))
         gsz = torch.zeros(K, device=dev)
         for g in range(K):
             gsz[g] = (gl == g).sum()
@@ -211,7 +222,7 @@ def main():
             _, _, Vt = torch.linalg.svd(Ehat, full_matrices=False); Br = Vt[:RCORR].T.to(dev)
             del z0, coef, Ehat
         else:  # random orthonormal
-            g = torch.Generator(device=dev).manual_seed(li)
+            g = torch.Generator(device=dev).manual_seed(SEED * 1000 + li)
             Br, _ = torch.linalg.qr(torch.randn(d, RCORR, generator=g, device=dev))
         pred = None
         if predictor != 'none':
@@ -237,11 +248,12 @@ def main():
         for li in range(nL):
             CFG[li]['active'] = False; CFG[li]['corr'] = None; CFG[li]['neuron'] = False
 
-    dense = ce_eval(); print(f"  dense ppl {dense:.3f}\n", flush=True)
+    dense = ce_eval(); report_metrics(dict(seed=SEED, configuration="dense", ppl=dense)); print(f"  dense ppl {dense:.3f}\n", flush=True)
     for bf in KEEPS:
         GRP = {li: grouping(li, bf) for li in range(nL)}
         setcfg(bf, GRP, 'group'); floor = ce_eval(); off()   # group-oracle masking, NO correction (the floor)
         setcfg(bf, GRP, 'neuron'); neu = ce_eval(); off()
+        report_metrics(dict(seed=SEED, keep=bf, dense=dense, group_oracle=floor, neuron_oracle=neu))
         print(f"  === keep{int(bf*100)} (dense {dense:.3f}, floor/group-oracle {floor:.3f}, neuron-oracle {neu:.3f}) ===", flush=True)
         # build the SVD basis + both predictors, and the random basis
         rows = []
@@ -272,6 +284,8 @@ def main():
         for name, v in rows:
             print(f"    {name:38s} {v:.3f}", flush=True)
         print(f"    neuron-oracle (reference)              {neu:.3f}\n", flush=True)
+        for key, (_, value) in zip(["svd_mlp", "svd_oracle", "svd_ridge", "random_mlp", "rrr_mlp", "rrr_oracle"], rows, strict=True):
+            report_metrics(dict(seed=SEED, keep=bf, configuration=key, ppl=value))
     print("READ: compares the correction's design choices in isolation (group-oracle selection).", flush=True)
     print("svd>random => the low-rank basis is real/learned; mlp>linear => nonlinearity helps;", flush=True)
     print("predicted vs oracle-coords => how much of the (low-rank) error is recoverable from x.", flush=True)

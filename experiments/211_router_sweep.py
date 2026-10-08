@@ -1,270 +1,378 @@
-"""Experiment 211 — ROUTER-DATA SWEEP: is our deploy gap under-training or intrinsic (SwiGLU)?
-Motivation: paper trains the selector on ~5M Wikipedia tokens (5000x1024, 30 ep); we used 8192.
-Our Qwen-7B SuperGLUE keep85: dense 0.800, best-select 0.760 (-0.040 structural), G-MoE deploy
-0.673 (-0.087 router), Ours deploy 0.699. Paper Phi-2 deploy-vs-dense is only -0.009 (GeLU/parallel).
-QUESTION: does the -0.087 router gap SHRINK toward best-select as we feed the router more DISTINCT
-tokens (=> under-training, baseline needs strengthening) or PLATEAU well below (=> intrinsic SwiGLU
-routing gap, paper's small gap is purely GeLU)? Either answer hardens the paper.
-
-Design (memory-safe): Pass A fixes structure (mean/kmeans/shared-split/PCA) on N_STRUCT=8192.
-Pass B streams up to max(SWEEP) tokens, accumulating ONLY compact (Z=PCA feats, rn=per-group
-residual norm) in fp16 on CPU (wide activations discarded). Then for each N in SWEEP, train the
-router on the (Z,rn) PREFIX and eval deploy SuperGLUE. dense + best-select are router-independent
-=> computed once. Qwen2.5-Coder-1.5B (SwiGLU), keep85.
-Run: python3 experiments/211_router_sweep.py
+"""Controlled shared-expert and adaptive-budget comparisons on Qwen2 models.
+Groups, representatives and fitted routers are reused across shared fractions and
+allocation rules. Fixed/global allocation executes the same number of groups on
+average; a causal threshold is calibrated on router data and reports actual keep.
+METRIC=ppl uses MBPP; METRIC=superglue uses WikiText-103 and six zero-shot tasks.
+No output correction is applied. Run only on GPUs explicitly selected by the caller.
 """
 from __future__ import annotations
-import sys, pathlib, types, gc, os
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-import torch, torch.nn.functional as F
+
+import gc
+import hashlib
+import json
+import math
+import os
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+import torch
+from torch import nn
+from torch.nn import functional as F
+from transformers import AutoTokenizer
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+from transformers.models.qwen2.modeling_qwen2 import (
+    Qwen2MLP, Qwen2DecoderLayer, Qwen2Model, Qwen2ForCausalLM,
+)
 
 MODEL = os.environ.get("HHMODEL", "Qwen/Qwen2.5-Coder-1.5B")
-N_STRUCT = 8192                                  # tokens to fix structure (saturates fast)
-SWEEP = [8192, 32768, 131072, 393216]            # router-training token counts (8K -> ~0.4M, 48x)
+SEED = int(os.environ.get("SEED", "0"))
+N_STRUCT = int(os.environ.get("NSTRUCT", "8192"))
+SWEEP = [int(v) for v in os.environ.get("SWEEP", "8192").split(",")]
+N_EVAL = int(os.environ.get("NEVAL", "4096"))
 CHUNK = 512
-KROUTE = 64
-BF = 0.85                                         # keep fraction (paper decoder operating point)
+K = 64
 RFEAT = 512
-HIDDEN = 512
-STEPS = 4000
+STEPS = int(os.environ.get("STEPS", "3000"))
+KEEPS = [float(v) for v in os.environ.get("KEEPS", "0.85,0.50,0.25").split(",")]
+SHARED = [float(v) for v in os.environ.get("SHARED", "0,0.6").split(",")]
+OUT = os.environ.get("OUT", "")
 
 
-def kmeans(X, k, iters=12, seed=0):
-    g = torch.Generator(device=X.device).manual_seed(seed)
-    c = X[torch.randperm(X.shape[0], generator=g, device=X.device)[:k]].clone()
-    for _ in range(iters):
-        a = torch.cdist(X, c).argmin(1)
-        for j in range(k):
-            m = a == j
-            if m.any():
-                c[j] = X[m].mean(0)
-    return a
+class Metric(Enum):
+    PPL = "ppl"
+    SUPERGLUE = "superglue"
 
 
-def mlp_fit(X, Y, dev, steps=STEPS, lr=3e-3, bs=2048, hidden=HIDDEN):
-    net = torch.nn.Sequential(torch.nn.Linear(X.shape[1], hidden), torch.nn.GELU(),
-                              torch.nn.Linear(hidden, Y.shape[1])).to(dev).float()
-    opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
-    gen = torch.Generator(device=dev).manual_seed(0)
-    with torch.enable_grad():
-        for _ in range(steps):
-            bi = torch.randint(0, X.shape[0], (bs,), generator=gen, device=dev)
-            opt.zero_grad(); F.mse_loss(net(X[bi]), Y[bi]).backward(); opt.step()
-    return net.eval()
+class Selector(Enum):
+    ORACLE = "oracle"
+    ROUTER = "router"
 
 
-def gm_forward(mlp, x):
-    sh = x.shape; xf = x.reshape(-1, sh[-1])
-    a = mlp.act_fn(mlp.gate_proj(xf)) * mlp.up_proj(xf)
-    if getattr(mlp, "_harvest", False):                  # stash RAW (unmasked) a + input for router data
-        mlp._a_cache = a.detach(); mlp._x_cache = xf.detach()
-    N = a.shape[0]; Kc = mlp._gsz.shape[0]
-    src, sel = mlp._mode.split("_")
-    if src == "oracle":
-        sq = ((a.float() - mlp._mean.float()).abs() * mlp._vn) ** 2
-        score = torch.zeros(N, Kc, device=a.device).index_add_(1, mlp._routed_grp_full, sq)
+class Allocation(Enum):
+    FIXED = "fixed"
+    GLOBAL = "global"
+    THRESHOLD = "threshold"
+
+
+METRIC = Metric(os.environ.get("METRIC", "ppl"))
+ALLOCATIONS = [Allocation(v) for v in os.environ.get("BUDGETS", "fixed,global,threshold").split(",")]
+
+
+@dataclass
+class Stats:
+    mean: torch.Tensor
+    vn: torch.Tensor
+    groups: torch.Tensor
+    xbar: torch.Tensor
+    projection: torch.Tensor
+    features: torch.Tensor
+    targets: torch.Tensor
+    oracle_scores: torch.Tensor
+
+
+@dataclass
+class State:
+    selector: Selector
+    allocation: Allocation
+    count: int
+    shared: torch.Tensor
+    threshold: float
+
+
+def group_selection(scores: torch.Tensor, state: State) -> torch.Tensor:
+    n, k = scores.shape
+    selected = torch.zeros((n, k), dtype=torch.bool, device=scores.device)
+    selected[:, state.shared] = True
+    pool = torch.ones(k, dtype=torch.bool, device=scores.device)
+    pool[state.shared] = False
+    candidates = pool.nonzero().flatten()
+    remaining = state.count - state.shared.numel()
+    if remaining == 0:
+        return selected
+    routed = scores[:, candidates]
+    if state.allocation is Allocation.FIXED:
+        chosen = routed.argsort(dim=1, descending=True, stable=True)[:, :remaining]
+        selected.scatter_(1, candidates[chosen], True)
+    elif state.allocation is Allocation.GLOBAL:
+        order = routed.reshape(-1).argsort(descending=True, stable=True)[:n * remaining]
+        rows = torch.div(order, candidates.numel(), rounding_mode="floor")
+        selected[rows, candidates[order % candidates.numel()]] = True
     else:
-        z = (xf.float() - mlp._xbar) @ mlp._P
-        score = mlp._router(z).float()
-    if sel == "uniform":
-        order = score.argsort(1, descending=True); so = mlp._gsz[order]
-        keep_ord = (so.cumsum(1) - so) < mlp._route_budget
-        selg = torch.zeros(N, Kc, dtype=torch.bool, device=a.device).scatter_(1, order, keep_ord)
-    elif sel == "global":
-        cost = mlp._gsz.float().unsqueeze(0).expand(N, Kc).reshape(-1)
-        o = score.reshape(-1).argsort(descending=True)
-        cum = cost[o].cumsum(0) - cost[o]
-        kf = torch.zeros(N * Kc, dtype=torch.bool, device=a.device); kf[o] = cum < (N * mlp._route_budget)
-        selg = kf.reshape(N, Kc)
-    else:                                            # thresh: causal per-token adaptive
-        selg = score >= mlp._tau
-    m = mlp._shared_mask.expand(N, -1).clone()
-    m = m + selg[:, mlp._routed_grp_full].to(m.dtype) * mlp._routed_is
-    m = m.clamp(max=1.0)
-    mlp._kept = m.mean().item()
-    out = mlp.down_proj(a * m + mlp._rep * (1 - m))
-    return out.reshape(sh[:-1] + (out.shape[-1],))
+        selected[:, candidates] = routed >= state.threshold
+    return selected
 
 
-def main():
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+class ExperimentalMLP(Qwen2MLP):
+    def __init__(self, config: Qwen2Config) -> None:
+        super().__init__(config)
+        self.router = nn.Sequential(nn.Linear(RFEAT, 512), nn.GELU(), nn.Linear(512, K)).float()
+        self.stats: Stats | None = None
+        self.state: State | None = None
+        self.capture = False
+        self.inputs: list[torch.Tensor] = []
+        self.activations: list[torch.Tensor] = []
+        self.kept = 0
+        self.total = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        if self.capture:
+            self.inputs.append(x.reshape(-1, x.shape[-1]).half().cpu())
+            self.activations.append(a.reshape(-1, a.shape[-1]).half().cpu())
+        if self.state is None:
+            return self.down_proj(a)
+        s = self.stats
+        if s is None:
+            raise RuntimeError("Selection requested before calibration")
+        af = a.reshape(-1, a.shape[-1])
+        if self.state.selector is Selector.ORACLE:
+            per = ((af.float() - s.mean) * s.vn).square()
+            scores = torch.zeros((af.shape[0], K), device=x.device).index_add_(1, s.groups, per)
+        else:
+            z = (x.reshape(-1, x.shape[-1]).float() - s.xbar) @ s.projection
+            scores = self.router(z)
+        selected = group_selection(scores, self.state)
+        mask = selected[:, s.groups]
+        self.kept += int(mask.sum().item())
+        self.total += mask.numel()
+        masked = torch.where(mask, af, s.mean.to(af.dtype))
+        return self.down_proj(masked.reshape_as(a))
+
+
+# These subclasses establish all execution modules during construction; the
+# pretrained parameter names remain compatible with the original checkpoint.
+class ExperimentalLayer(Qwen2DecoderLayer):
+    def __init__(self, config: Qwen2Config, layer_idx: int) -> None:
+        super().__init__(config, layer_idx)
+        self.mlp = ExperimentalMLP(config)
+
+
+class ExperimentalModel(Qwen2Model):
+    def __init__(self, config: Qwen2Config) -> None:
+        super().__init__(config)
+        self.layers = nn.ModuleList([ExperimentalLayer(config, i) for i in range(config.num_hidden_layers)])
+
+
+class ExperimentalLM(Qwen2ForCausalLM):
+    def __init__(self, config: Qwen2Config) -> None:
+        super().__init__(config)
+        self.model = ExperimentalModel(config)
+
+
+def balanced_groups(weights: torch.Tensor) -> torch.Tensor:
+    x = F.normalize(weights.float(), dim=1)
+    gen = torch.Generator(device=x.device).manual_seed(SEED)
+    centers = x[torch.randperm(x.shape[0], generator=gen, device=x.device)[:K]].clone()
+    for _ in range(12):
+        labels = torch.cdist(x, centers).argmin(1)
+        for g in range(K):
+            if (labels == g).any():
+                centers[g] = x[labels == g].mean(0)
+    distances = torch.cdist(x, centers)
+    preferences = distances.argsort(dim=1, stable=True)
+    first = distances.gather(1, preferences[:, :2])
+    order = (first[:, 1] - first[:, 0]).argsort(descending=True, stable=True).tolist()
+    capacity = x.shape[0] // K
+    if x.shape[0] % K:
+        raise ValueError("Exact matched group budgets require FFN width divisible by K")
+    counts = [0] * K
+    assigned = [0] * x.shape[0]
+    for i in order:
+        for g in preferences[i].tolist():
+            if counts[g] < capacity:
+                assigned[i] = g
+                counts[g] += 1
+                break
+    return torch.tensor(assigned, device=x.device)
+
+
+def fit_router(mlp: ExperimentalMLP, n: int, layer: int) -> None:
+    s = mlp.stats
+    if s is None:
+        raise RuntimeError("Missing router data")
+    torch.manual_seed(SEED + layer)
+    for module in mlp.router:
+        if isinstance(module, nn.Linear):
+            module.reset_parameters()
+    device = s.mean.device
+    x = s.features[:n].float().to(device)
+    y = s.targets[:n].float().to(device)
+    opt = torch.optim.Adam(mlp.router.parameters(), lr=3e-3, weight_decay=1e-4)
+    generator = torch.Generator(device=device).manual_seed(SEED)
+    with torch.enable_grad():
+        for _ in range(STEPS):
+            indices = torch.randint(0, n, (2048,), generator=generator, device=device)
+            opt.zero_grad()
+            F.mse_loss(mlp.router(x[indices]), y[indices]).backward()
+            opt.step()
+    mlp.router.eval()
+
+
+def main() -> None:
     from datasets import load_dataset
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    # wikitext-103 train: enough tokens for the largest sweep point
-    wt = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train")
-    need = max(SWEEP) + N_STRUCT + CHUNK
-    buf, ntok = [], 0
-    for t in wt["text"]:
-        if not t.strip():
-            continue
-        e = tok(t, return_tensors="pt").input_ids[0]
-        buf.append(e); ntok += e.numel()
-        if ntok >= need:
-            break
-    ids = torch.cat(buf)
-    print(f"  MODEL={MODEL}  tokens collected={ids.numel()} (need {need})", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, trust_remote_code=True).to(dev).eval()
+    torch.manual_seed(SEED)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    dev = "cuda"
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    corpus_fingerprints: dict[str, str] = {}
+    if METRIC is Metric.PPL:
+        code: list[str] = []
+        for split in ["train", "test", "validation", "prompt"]:
+            ds = load_dataset("google-research-datasets/mbpp", "full", split=split)
+            corpus_fingerprints[split] = ds._fingerprint
+            code.extend(ds["code"])
+        ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
+    else:
+        ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train")
+        corpus_fingerprints["train"] = ds._fingerprint
+        pieces: list[torch.Tensor] = []
+        count = 0
+        for text in ds["text"]:
+            if not text.strip():
+                continue
+            piece = tok(text, return_tensors="pt").input_ids[0]
+            pieces.append(piece)
+            count += piece.numel()
+            if count >= N_STRUCT + max(SWEEP) + N_EVAL:
+                break
+        ids = torch.cat(pieces)
+    needed = N_STRUCT + max(SWEEP) + N_EVAL
+    if ids.numel() < needed:
+        raise ValueError(f"Corpus too short: {ids.numel()} < {needed}")
+    model = ExperimentalLM.from_pretrained(MODEL, dtype=torch.float16).to(dev).eval()
     model.config.use_cache = False
-    layers = model.model.layers; nL = len(layers)
+    mlps: list[ExperimentalMLP] = []
+    for layer in model.model.layers:
+        if not isinstance(layer, ExperimentalLayer):
+            raise TypeError("Unexpected decoder layer")
+        mlps.append(layer.mlp)
+        layer.mlp.router.float()
     torch.set_grad_enabled(False)
+    metadata = dict(model=MODEL, revision=model.config._commit_hash, seed=SEED,
+                    torch=torch.__version__, gpu=torch.cuda.get_device_name(),
+                    source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    corpus_fingerprints=corpus_fingerprints,
+                    tokens_sha256=hashlib.sha256(ids[:needed].numpy().tobytes()).hexdigest(),
+                    n_struct=N_STRUCT, router_tokens=SWEEP, eval_tokens=N_EVAL,
+                    eval_start=N_STRUCT + max(SWEEP), groups=K, steps=STEPS,
+                    correction=False, metric=METRIC.value, shared_fractions=SHARED,
+                    allocations=[a.value for a in ALLOCATIONS], keeps=KEEPS)
+    print(json.dumps(metadata), flush=True)
+    rows: list[dict[str, object]] = []
 
-    SG = ["boolq", "cb", "copa", "rte", "wic", "wsc"]
-    import lm_eval
-    from lm_eval.models.huggingface import HFLM
+    def evaluate(tag: str) -> dict[str, object]:
+        for mlp in mlps:
+            mlp.kept = mlp.total = 0
+        if METRIC is Metric.PPL:
+            total_loss = 0.0
+            total_tokens = 0
+            first_loss = 0.0
+            first_tokens = 0
+            start = N_STRUCT + max(SWEEP)
+            for off in range(0, N_EVAL, CHUNK):
+                seq = ids[start + off:start + min(off + CHUNK, N_EVAL)].unsqueeze(0).to(dev)
+                loss = F.cross_entropy(model(seq).logits[0, :-1].float(), seq[0, 1:], reduction="sum").item()
+                total_loss += loss
+                total_tokens += seq.shape[1] - 1
+                if off < 1024:
+                    first_loss += loss
+                    first_tokens += seq.shape[1] - 1
+            values: dict[str, object] = dict(ppl=math.exp(total_loss / total_tokens),
+                                            ppl_first1024=math.exp(first_loss / first_tokens))
+        else:
+            import lm_eval
+            from lm_eval.models.huggingface import HFLM
+            tasks = ["boolq", "cb", "copa", "rte", "wic", "wsc"]
+            lm = HFLM(pretrained=model, tokenizer=tok, batch_size=4)
+            result = lm_eval.simple_evaluate(model=lm, tasks=tasks, num_fewshot=0,
+                                            random_seed=SEED, numpy_random_seed=SEED,
+                                            torch_random_seed=SEED, fewshot_random_seed=SEED,
+                                            verbosity="ERROR")
+            scores = {t: result["results"][t]["acc,none"] for t in tasks}
+            values = dict(superglue=sum(scores.values()) / len(scores), tasks=scores)
+            del lm, result
+        total = sum(m.total for m in mlps)
+        values.update(tag=tag, actual_keep=sum(m.kept for m in mlps) / total if total else 1.0)
+        print(json.dumps(values), flush=True)
+        gc.collect()
+        torch.cuda.empty_cache()
+        return values
 
-    def sg_eval(tag):
-        lm = HFLM(pretrained=model, tokenizer=tok, batch_size=4)
-        r = lm_eval.simple_evaluate(model=lm, tasks=SG, num_fewshot=0, verbosity="ERROR")
-        accs = {t: (r['results'][t].get('acc,none') or r['results'][t].get('acc')) for t in SG}
-        avg = sum(accs.values()) / len(accs)
-        print(f"  [{tag}] SG-avg={avg:.4f}  (" + " ".join(f"{t}={accs[t]:.3f}" for t in SG) + ")", flush=True)
-        del lm, r; gc.collect(); torch.cuda.empty_cache()
-        return avg
+    dense = evaluate("dense")
+    for mlp in mlps:
+        mlp.capture = True
+    for off in range(0, N_STRUCT + max(SWEEP), CHUNK):
+        model(ids[off:off + CHUNK].unsqueeze(0).to(dev))
+    for li, mlp in enumerate(mlps):
+        mlp.capture = False
+        x = torch.cat(mlp.inputs).float().to(dev)
+        a = torch.cat(mlp.activations).float().to(dev)
+        mlp.inputs.clear()
+        mlp.activations.clear()
+        mean = a[:N_STRUCT].mean(0)
+        xbar = x[:N_STRUCT].mean(0)
+        _, _, vt = torch.linalg.svd(x[:N_STRUCT] - xbar, full_matrices=False)
+        projection = vt[:RFEAT].T.contiguous()
+        groups = balanced_groups(mlp.gate_proj.weight.detach())
+        wd = mlp.down_proj.weight.detach().float()
+        vn = wd.norm(dim=0)
+        delta = a[N_STRUCT:] - mean
+        oracle = torch.zeros((delta.shape[0], K), device=dev).index_add_(1, groups, (delta * vn).square())
+        targets = torch.stack([(delta[:, groups == g] @ wd[:, groups == g].T).norm(dim=1)
+                               for g in range(K)], dim=1)
+        features = (x[N_STRUCT:] - xbar) @ projection
+        mlp.stats = Stats(mean, vn, groups, xbar, projection, features.half().cpu(),
+                          targets.half().cpu(), oracle.half().cpu())
+        del x, a, delta, targets, features, oracle, wd, vt
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"Prepared layer {li + 1}/{len(mlps)}", flush=True)
 
-    dense_sg = sg_eval("DENSE")
+    def save() -> None:
+        if OUT:
+            Path(OUT).write_text(json.dumps(dict(metadata=metadata, dense=dense, rows=rows), indent=2))
 
-    # ---------- Pass A: fix structure on N_STRUCT tokens ----------
-    capx = {li: [] for li in range(nL)}; capa = {li: [] for li in range(nL)}
-    hs = []
-    for li in range(nL):
-        mlp = layers[li].mlp
-        hs.append(mlp.gate_proj.register_forward_pre_hook(
-            (lambda li: (lambda _m, a: capx[li].append(a[0].reshape(-1, a[0].shape[-1]).float().cpu())))(li)))
-        hs.append(mlp.down_proj.register_forward_pre_hook(
-            (lambda li: (lambda _m, a: capa[li].append(a[0].reshape(-1, a[0].shape[-1]).float().cpu())))(li)))
-    for c0 in range(0, N_STRUCT, CHUNK):
-        model(ids[c0:c0 + CHUNK].unsqueeze(0).to(dev))
-    for h in hs:
-        h.remove()
-    dff = capa[0][0].shape[1]
-    print(f"  {nL} layers, dff={dff}; structure on {N_STRUCT} tokens", flush=True)
-
-    B = int(round(BF * dff))
-    STR = {}                                          # per-layer structure
-    for li in range(nL):
-        x = torch.cat(capx[li]).to(dev); a = torch.cat(capa[li]).to(dev)
-        Wd = layers[li].mlp.down_proj.weight.detach().float().to(dev)
-        Wd = Wd if Wd.shape[1] == dff else Wd.T        # [hidden, dff]
-        Wup = layers[li].mlp.gate_proj.weight.detach().float().to(dev)
-        Wup = Wup if Wup.shape[0] == dff else Wup.T
-        abar = a.mean(0); vn = Wd.norm(dim=0).clone()
-        xbar = x.mean(0); _, _, Vt = torch.linalg.svd(x - xbar, full_matrices=False)
-        P = Vt[:RFEAT].T
-        contrib = (a - abar).abs() * vn
-        # contrib/Wup used only in build_structure -> keep on CPU; abar/vn/xbar/P/Wd stay on GPU
-        STR[li] = dict(abar=abar, vn=vn, xbar=xbar, P=P, Wd=Wd, Wup=Wup.cpu(), contrib=contrib.cpu())
-        capx[li] = None; capa[li] = None
-        del x, a; gc.collect(); torch.cuda.empty_cache()
-    del capx, capa; gc.collect()
-
-    def build_structure(sf):
-        """Set shared/routed split + grouping for given shared fraction; returns per-layer group idx."""
-        ginfo = {}
-        for li in range(nL):
-            s = STR[li]
-            contrib = s['contrib'].to(dev)             # [N_STRUCT, dff]
-            topB = contrib.argsort(1, descending=True)[:, :B]
-            freq = torch.zeros(dff, device=dev)
-            freq.scatter_add_(0, topB.reshape(-1), torch.ones(topB.numel(), device=dev))
-            n_shared = int(round(sf * B))
-            shared_idx = freq.topk(n_shared).indices if n_shared > 0 else torch.tensor([], dtype=torch.long, device=dev)
-            shared_mask = torch.zeros(dff, device=dev); shared_mask[shared_idx] = 1.0
-            routed_pool = (shared_mask < 0.5).nonzero().flatten()
-            route_budget = B - n_shared
-            Wup = s['Wup'].to(dev)
-            grp_local = kmeans(F.normalize(Wup[routed_pool], dim=1), min(KROUTE, len(routed_pool)), seed=0)
-            del contrib, Wup
-            Kc = int(grp_local.max().item()) + 1
-            gsz = torch.zeros(Kc, device=dev); grp_full = torch.zeros(dff, dtype=torch.long, device=dev)
-            routed_is = torch.zeros(dff, device=dev); gidx = []
-            for g in range(Kc):
-                ix = routed_pool[(grp_local == g).nonzero().flatten()]
-                gsz[g] = len(ix); grp_full[ix] = g; routed_is[ix] = 1.0; gidx.append(ix)
-            mlp = layers[li].mlp
-            mlp._mean = s['abar'].to(model.dtype); mlp._vn = s['vn']
-            mlp._gsz = gsz.to(model.dtype); mlp._route_budget = float(route_budget)
-            mlp._shared_mask = shared_mask.to(model.dtype).unsqueeze(0)
-            mlp._routed_grp_full = grp_full; mlp._routed_is = routed_is.to(model.dtype)
-            mlp._rep = mlp._mean; mlp._xbar = s['xbar']; mlp._P = s['P']
-            mlp.forward = types.MethodType(gm_forward, layers[li].mlp)
-            ginfo[li] = dict(gidx=gidx, Kc=Kc, route_budget=route_budget)
-        return ginfo
-
-    def set_mode(mode):
-        for li in range(nL):
-            layers[li].mlp._mode = mode
-
-    def stream_router_data(ginfo, n_router):
-        """Pass B: stream n_router tokens, accumulate compact (Z, rn) fp16 on CPU per layer.
-        Uses gm_forward's stashed RAW a (down_proj input is masked, so we must use the stash)."""
-        for li in range(nL):
-            layers[li].mlp._harvest = True
-        Z = {li: [] for li in range(nL)}; RN = {li: [] for li in range(nL)}
-        base = N_STRUCT                                  # tokens AFTER the structure window
-        for c0 in range(base, base + n_router, CHUNK):
-            xx = ids[c0:c0 + CHUNK].unsqueeze(0).to(dev)
-            model(xx)
-            for li in range(nL):
-                s = STR[li]; mlp = layers[li].mlp
-                xf = mlp._x_cache.float(); af = mlp._a_cache.float()
-                z = (xf - s['xbar']) @ s['P']            # [n, rfeat]
-                dev_a = af - s['abar']
-                Kc = ginfo[li]['Kc']
-                rn = torch.zeros(z.shape[0], Kc, device=dev)
-                for g in range(Kc):
-                    ix = ginfo[li]['gidx'][g]
-                    if len(ix):
-                        rn[:, g] = (dev_a[:, ix] @ s['Wd'][:, ix].T).norm(dim=1)
-                Z[li].append(z.half().cpu()); RN[li].append(rn.half().cpu())
-                mlp._a_cache = None; mlp._x_cache = None
-        for li in range(nL):
-            layers[li].mlp._harvest = False
-            Z[li] = torch.cat(Z[li]); RN[li] = torch.cat(RN[li])
-        gc.collect(); torch.cuda.empty_cache()
-        return Z, RN
-
-    def train_routers(Z, RN, n):
-        for li in range(nL):
-            Ztr = Z[li][:n].float().to(dev); Ytr = RN[li][:n].float().to(dev)
-            router = mlp_fit(Ztr, Ytr, dev)
-            # calibrate tau to hit avg route_budget neurons/token
-            with torch.no_grad():
-                pred = router(Ztr).float()
-            mlp = layers[li].mlp; gsz = mlp._gsz.float(); rb = mlp._route_budget
-            fc = gsz.unsqueeze(0).expand_as(pred).reshape(-1); fp = pred.reshape(-1)
-            o = fp.argsort(descending=True); cum = fc[o].cumsum(0) - fc[o]
-            keepn = cum < (pred.shape[0] * rb)
-            mlp._tau = fp[o][keepn].min() if keepn.any() else fp.max()
-            mlp._router = router
-            del Ztr, Ytr, pred; gc.collect(); torch.cuda.empty_cache()
-
-    print(f"\n  ROUTER-DATA SWEEP (Qwen SwiGLU, keep{int(BF*100)}, dense SG-avg {dense_sg:.4f})", flush=True)
-    print(f"  best-select (oracle) is router-independent; deploy varies with router tokens.\n", flush=True)
-
-    results = {"dense": dense_sg}
-    for sf, name, omode, dmode in [(0.0, "G-MoE", "oracle_uniform", "deploy_uniform"),
-                                   (0.6, "Ours", "oracle_global", "deploy_thresh")]:
-        ginfo = build_structure(sf)
-        set_mode(omode); bs_acc = sg_eval(f"{name} best-select (oracle)")
-        results[f"{name}_bestselect"] = bs_acc
-        Z, RN = stream_router_data(ginfo, max(SWEEP))
-        for n in SWEEP:
-            train_routers(Z, RN, n)
-            set_mode(dmode); acc = sg_eval(f"{name} deploy  router_tokens={n}")
-            results[f"{name}_deploy_{n}"] = acc
-        del Z, RN; gc.collect(); torch.cuda.empty_cache()
-        print("  " + "-" * 60, flush=True)
-
-    print("\n=== SUMMARY (SG-avg) ===", flush=True)
-    print(f"  dense {results['dense']:.4f}", flush=True)
-    for name in ["G-MoE", "Ours"]:
-        bs = results[f"{name}_bestselect"]
-        row = " ".join(f"{n//1024}K={results[f'{name}_deploy_{n}']:.4f}" for n in SWEEP)
-        print(f"  {name}: best-select={bs:.4f} | deploy {row}", flush=True)
-    print("\nREAD: if deploy RISES toward best-select with more tokens => under-training (strengthen", flush=True)
-    print("baseline). if it PLATEAUS below best-select => intrinsic SwiGLU routing gap (paper's small", flush=True)
-    print("gap is GeLU-specific). Either way the shared-floor (Ours) recovers part of the gap.", flush=True)
+    save()
+    for n in SWEEP:
+        for li, mlp in enumerate(mlps):
+            fit_router(mlp, n, li)
+            print(f"Fitted router {li + 1}/{len(mlps)} on {n} tokens", flush=True)
+        for keep in KEEPS:
+            count = max(1, min(K, round(keep * K)))
+            for shared_fraction in SHARED:
+                for selector in Selector:
+                    for allocation in ALLOCATIONS:
+                        for mlp in mlps:
+                            s = mlp.stats
+                            if s is None:
+                                raise RuntimeError("Missing calibrated state")
+                            frequency = torch.zeros(K, device=dev)
+                            top = s.oracle_scores[:n].float().to(dev).argsort(dim=1, descending=True, stable=True)[:, :count]
+                            frequency.scatter_add_(0, top.reshape(-1), torch.ones(top.numel(), device=dev))
+                            shared = frequency.argsort(descending=True, stable=True)[:round(shared_fraction * count)]
+                            remaining_pool = torch.ones(K, dtype=torch.bool, device=dev)
+                            remaining_pool[shared] = False
+                            if selector is Selector.ORACLE:
+                                calibration = s.oracle_scores[:n].float().to(dev)
+                            else:
+                                calibration = mlp.router(s.features[:n].float().to(dev))
+                            required = n * (count - shared.numel())
+                            ranked = calibration[:, remaining_pool].reshape(-1).sort(dim=0, descending=True, stable=True).values
+                            threshold = float(ranked[required - 1]) if required else math.inf
+                            mlp.state = State(selector, allocation, count, shared, threshold)
+                        tag = f"keep={keep} shared={shared_fraction} selector={selector.value} budget={allocation.value}"
+                        row = evaluate(tag)
+                        row.update(keep=keep, group_count=count, shared_fraction=shared_fraction,
+                                   selector=selector.value, budget=allocation.value, router_tokens=n)
+                        rows.append(row)
+                        save()
+    print("Completed controlled comparisons.", flush=True)
 
 
 if __name__ == "__main__":

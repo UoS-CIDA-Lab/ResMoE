@@ -1,18 +1,17 @@
-"""Experiment 234 — low-rank output correction on a NON-GATED CAUSAL decoder (ReLU): OPT-1.3b.
-The correction is activation-agnostic: it captures a = act(W_in x) and reconstructs the dropped-output
-error e = sum_{dropped}(a_k - abar_k) v_k from x, regardless of ReLU/GeLU/SwiGLU. OPT has fc1/fc2 (no gate),
-so we capture x = fc1 input, a = fc2 input. Reports dense / neuron-oracle / group-oracle / +predicted-corr
-at keep50 & keep25 (same protocol as 233), to populate the ReLU row of the multi-model correction table.
-Run: HHMODEL=facebook/opt-1.3b python3 experiments/234_relu_causal.py
+"""Experiment 253 — DEPTH-ADAPTIVE correction rank: redistribute the total low-rank-correction budget
+across layers instead of using a fixed per-layer rank. Same pipeline as 234 (group-oracle dense / neuron /
+group references + predicted low-rank correction on a causal decoder), but the correction rank r_li is
+chosen per layer. RANKMODE=fixed reproduces 234 (RCORR per layer); RANKMODE=budget keeps the SAME total
+rank nL*RCORR and waterfills it toward layers whose dropped-output error E is higher effective rank
+(measure the per-layer profile first with 252). Equal total cost => isolates the depth-allocation effect.
+Run: HHMODEL=facebook/opt-1.3b RANKMODE=budget python3 experiments/253_budget_correction.py
+     HHMODEL=facebook/opt-1.3b RANKMODE=fixed  python3 experiments/253_budget_correction.py   # = 234
 """
 from __future__ import annotations
 import sys, pathlib, gc, os
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from experiments.reproducibility import configure_determinism, report_provenance, report_metrics
+from experiments.reproducibility import load_mbpp_code
 import torch, torch.nn as nn, torch.nn.functional as F
-
-SEED = int(os.environ.get("SEED", "0"))
-configure_determinism(SEED)
 
 MODEL = os.environ.get("HHMODEL", "facebook/opt-1.3b")
 N_CALIB = int(os.environ.get("NCALIB", "8192"))
@@ -22,6 +21,9 @@ K = 128
 RCORR = 128
 RFEAT = 512
 KEEPS = [float(x) for x in os.environ.get("KEEPS", "0.50,0.25").split(",")]
+RANKMODE = os.environ.get("RANKMODE", "budget")           # budget=redistribute nL*RCORR | fixed=RCORR per layer (=234)
+RMIN = int(os.environ.get("RMIN", "16"))                  # per-layer rank floor (budget mode)
+RMAX = int(os.environ.get("RMAX", "256"))                 # per-layer rank ceiling (budget mode)
 
 
 def weighted_kmeans_centroids(X, w, k, iters=20, seed=0):
@@ -49,14 +51,10 @@ def balanced_assign(X, centroids):
     return torch.tensor(assign, device=X.device, dtype=torch.long)
 
 
-def mlp_fit(
-    X: torch.Tensor, Y: torch.Tensor, dev: str, steps: int = 3000,
-    hidden: int = 512, lr: float = 3e-3, bs: int = 2048,
-) -> nn.Sequential:
-    torch.manual_seed(SEED)
+def mlp_fit(X, Y, dev, steps=3000, hidden=512, lr=3e-3, bs=2048):
     net = nn.Sequential(nn.Linear(X.shape[1], hidden), nn.GELU(), nn.Linear(hidden, Y.shape[1])).to(dev).float()
     opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
-    gen = torch.Generator(device=dev).manual_seed(SEED)
+    gen = torch.Generator(device=dev).manual_seed(0)
     with torch.enable_grad():
         for _ in range(steps):
             bi = torch.randint(0, X.shape[0], (bs,), generator=gen, device=dev)
@@ -96,18 +94,11 @@ def find_ffn(layer):
         return mlp.c_fc, mlp.c_proj
     raise RuntimeError("unknown FFN structure")
 
-
-def main() -> None:
+def main():
     from transformers import AutoTokenizer, AutoModelForCausalLM
-    from datasets import load_dataset
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    code: list[str] = []
-    fingerprints: dict[str, str] = {}
-    for sp in ["train", "test", "validation", "prompt"]:
-        dataset = load_dataset("google-research-datasets/mbpp", "full", split=sp)
-        fingerprints[sp] = dataset._fingerprint
-        code.extend(dataset["code"])
+    code = load_mbpp_code()
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, trust_remote_code=True).to(dev).eval()
     model.config.use_cache = False
@@ -119,24 +110,6 @@ def main() -> None:
     for li in range(nL):
         ip, op = find_ffn(layers[li]); inproj.append(ip); outproj.append(op)
     torch.set_grad_enabled(False)
-    report_provenance(source=__file__, model=MODEL, revision=model.config._commit_hash,
-                      seed=SEED, tokens=ids, fingerprints=fingerprints,
-                      calibration_items=N_CALIB, evaluation_items=N_EVAL, chunk=CHUNK)
-
-    QBITS = int(os.environ.get("QBITS", "0"))                 # 0=off; else fake-quant FFN weights (composability)
-    if QBITS:
-        qmax = 2 ** (QBITS - 1) - 1
-
-        def fakequant(W):
-            s = W.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / qmax
-            return ((W / s).round().clamp(-qmax, qmax) * s)
-        nq = 0
-        for li in range(nL):
-            mlp = getattr(layers[li], "mlp", layers[li])
-            for m in [inproj[li], outproj[li], getattr(mlp, "up_proj", None)]:
-                if m is not None:
-                    m.weight.data = fakequant(m.weight.data.float()).to(m.weight.dtype); nq += 1
-        print(f"  fake-quantized {nq} FFN weight matrices to {QBITS}-bit (composability test)", flush=True)
 
     CFG = {li: {'active': False} for li in range(nL)}
     XC = {li: None for li in range(nL)}
@@ -166,7 +139,7 @@ def main() -> None:
                 return None
             sh = output.shape
             z = (XC[li].float() - cfg['xbar']) @ cfg['P']
-            ehat = cfg['pred'](z) @ cfg['Br'].T
+            ehat = cfg['pred'](z) @ cfg['Br'].T                # Br is [d, r_li]: any per-layer rank works
             return (output.reshape(-1, sh[-1]) + ehat.to(output.dtype)).reshape(sh)
         return hook
     for li in range(nL):
@@ -175,7 +148,7 @@ def main() -> None:
         outproj[li].register_forward_hook(dpost(li))
 
     # ---- harvest ----
-    capa: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}; capx: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}
+    capa = {li: [] for li in range(nL)}; capx = {li: [] for li in range(nL)}
     hs = []
     for li in range(nL):
         hs.append(outproj[li].register_forward_pre_hook(
@@ -204,34 +177,80 @@ def main() -> None:
         af = a.float().to(dev); vn = Wd.norm(dim=0); abar = af.mean(0)
         xbar = x.mean(0); _, _, VtX = torch.linalg.svd(x - xbar, full_matrices=False)
         STR[li] = dict(a=a, x=x.half().cpu(), abar=abar, vn=vn, Wd=Wd.cpu(), xbar=xbar, P=VtX[:RFEAT].T)
-        del capa[li], capx[li]
+        capa[li] = None; capx[li] = None
         del af, x, Wd; gc.collect(); torch.cuda.empty_cache()
-    print(f"  MODEL={MODEL} dff={dff} nL={nL} act={getattr(model.config,'activation_function',getattr(model.config,'hidden_act','?'))}", flush=True)
+    print(f"  MODEL={MODEL} dff={dff} nL={nL} act={getattr(model.config,'activation_function',getattr(model.config,'hidden_act','?'))} RANKMODE={RANKMODE}", flush=True)
 
-    def grouping(li: int, bf: float) -> tuple[torch.Tensor, torch.Tensor]:
+    def grouping(li, bf):
         s = STR[li]; a = s['a'].float().to(dev); vn = s['vn']; abar = s['abar']; B = int(round(bf * dff))
         Bind = keep_topB_neuron((a - abar).abs() * vn, B).float()
         w = ((a - abar).abs() * vn).mean(0)
-        gl = balanced_assign(Bind.T.contiguous(), weighted_kmeans_centroids(Bind.T.contiguous(), w, K, seed=SEED))
+        gl = balanced_assign(Bind.T.contiguous(), weighted_kmeans_centroids(Bind.T.contiguous(), w, K, seed=0))
         gsz = torch.zeros(K, device=dev)
         for g in range(K):
             gsz[g] = (gl == g).sum()
         del a, Bind; gc.collect(); torch.cuda.empty_cache()
         return gsz, gl
 
-    def basis_and_pred(li, bf, gsz, gf):
+    def error_svd(li, bf, gsz, gf):
+        """Build the group-oracle dropped-output error E and cache its top-RMAX right basis, full singular
+        spectrum, and projected targets c_full=E@Vt^T (predictor target for any r<=RMAX is c_full[:, :r],
+        so the rank can be chosen AFTER the single SVD)."""
         s = STR[li]; a = s['a'].float().to(dev); abar = s['abar']; Wd = s['Wd'].to(dev)
         B = int(round(bf * dff))
         m = oracle_mask(a, abar, s['vn'], gsz, gf, B)
-        drop = a - (a * m + abar * (1 - m))
-        E = drop @ Wd.T
-        del a, m, drop, Wd; gc.collect(); torch.cuda.empty_cache()
-        Ec = E.cpu(); _, _, Vt = torch.linalg.svd(Ec, full_matrices=False); Br = Vt[:RCORR].T.to(dev)
-        c = E @ Br
+        E = (a - (a * m + abar * (1 - m))) @ Wd.T
+        del a, m, Wd; gc.collect(); torch.cuda.empty_cache()
+        Ec = E.cpu(); _, S, Vt = torch.linalg.svd(Ec, full_matrices=False)
+        rmax = min(RMAX, Vt.shape[0])
+        Vt_top = Vt[:rmax].contiguous()                       # [rmax, d] fp32 cpu
+        c_full = (E @ Vt_top.T.to(dev)).cpu()                 # [N, rmax] fp32 projected targets (= E@Br)
+        del E, Ec, Vt; gc.collect(); torch.cuda.empty_cache()
+        return Vt_top, S, c_full
+
+    def build_pred(li, r, Vt_top, c_full):
+        s = STR[li]
+        Br = Vt_top[:r].T.to(dev)                             # [d, r]
+        c = c_full[:, :r].to(dev)                             # = E @ Br, no recompute
         z = (s['x'].float().to(dev) - s['xbar']) @ s['P']
         pred = mlp_fit(z, c, dev)
-        del E, Ec, Vt, c, z; gc.collect(); torch.cuda.empty_cache()
+        del c, z; gc.collect(); torch.cuda.empty_cache()
         return Br, pred
+
+    def alloc_ranks(SPEC):
+        """Per-layer rank. fixed: RCORR each (= 234). budget: redistribute the total R=nL*RCORR by
+        waterfilling to a common cumulative-energy threshold tau* (more rank to high-effective-rank
+        layers), at equal total cost."""
+        lis = sorted(SPEC)
+        if RANKMODE != "budget":
+            return {li: min(RCORR, len(SPEC[li])) for li in lis}, None
+        R = RCORR * len(lis)
+
+        def r_at(S, tau):
+            s2 = S.double() ** 2; e = s2.cumsum(0) / s2.sum().clamp(min=1e-30)
+            return int((e < tau).sum().item()) + 1
+
+        def cl(r): return max(RMIN, min(RMAX, r))
+        def total_at(tau): return sum(cl(r_at(SPEC[li], tau)) for li in lis)
+        lo, hi = 0.0, 1.0
+        for _ in range(50):                                   # bisection: total_at is monotone in tau
+            mid = (lo + hi) / 2
+            if total_at(mid) < R: lo = mid
+            else: hi = mid
+        tau = lo
+        alloc = {li: cl(r_at(SPEC[li], tau)) for li in lis}
+        cur = sum(alloc.values())                             # exact fixup to R by marginal energy
+        nextval = lambda li: (SPEC[li][alloc[li]].item() if alloc[li] < len(SPEC[li]) else 0.0)
+        prevval = lambda li: (SPEC[li][alloc[li] - 1].item() if 0 < alloc[li] <= len(SPEC[li]) else 0.0)
+        while cur < R:
+            cand = [li for li in lis if alloc[li] < min(RMAX, len(SPEC[li]))]
+            if not cand: break
+            li = max(cand, key=nextval); alloc[li] += 1; cur += 1
+        while cur > R:
+            cand = [li for li in lis if alloc[li] > RMIN]
+            if not cand: break
+            li = min(cand, key=prevval); alloc[li] -= 1; cur -= 1
+        return alloc, tau
 
     def setcfg(bf, GRP, mode, Br=None, pred=None):
         B = int(round(bf * dff))
@@ -246,18 +265,29 @@ def main() -> None:
         for li in range(nL):
             CFG[li]['active'] = False; CFG[li]['corr'] = False; CFG[li]['neuron'] = False
 
-    dense = ce_eval(); report_metrics(dict(seed=SEED, configuration="dense", ppl=dense)); print(f"  dense ppl {dense:.3f}\n", flush=True)
+    dense = ce_eval(); print(f"  dense ppl {dense:.3f}\n", flush=True)
     for bf in KEEPS:
         GRP = {li: grouping(li, bf) for li in range(nL)}
         setcfg(bf, GRP, 'group'); floor = ce_eval(); off()
         setcfg(bf, GRP, 'neuron'); neu = ce_eval(); off()
+        SPEC = {}; CACHE = {}
+        for li in range(nL):
+            Vt_top, S, c_full = error_svd(li, bf, *GRP[li])
+            SPEC[li] = S; CACHE[li] = (Vt_top, c_full)
+        alloc, tau = alloc_ranks(SPEC)
         BR = {}; PRED = {}
         for li in range(nL):
-            BR[li], PRED[li] = basis_and_pred(li, bf, *GRP[li])
+            Vt_top, c_full = CACHE[li]
+            BR[li], PRED[li] = build_pred(li, alloc[li], Vt_top, c_full)
+        CACHE = None; gc.collect(); torch.cuda.empty_cache()
+        rs = [alloc[li] for li in range(nL)]
+        taustr = f" tau*={tau:.4f}" if tau is not None else ""
+        print(f"  [keep{int(bf*100)}] RANKMODE={RANKMODE} rank: min={min(rs)} mean={sum(rs)/nL:.1f} "
+              f"max={max(rs)} total={sum(rs)} (budget={RCORR*nL}){taustr}", flush=True)
         setcfg(bf, GRP, 'corr', BR, PRED); corr = ce_eval(); off()
-        report_metrics(dict(seed=SEED, keep=bf, qbits=QBITS, dense=dense, group_oracle=floor, neuron_oracle=neu, corrected=corr))
         print(f"  keep{int(bf*100)}: dense {dense:.3f} | neu-oracle {neu:.3f} | group-oracle {floor:.3f} | +corr {corr:.3f}", flush=True)
-    print("\nREAD: ReLU (OPT) row for the multi-model correction table; corr<group-oracle => correction generalizes to ReLU.", flush=True)
+    print("\nREAD: compare RANKMODE=budget vs fixed at equal total rank (=nL*RCORR); budget's +corr below fixed's", flush=True)
+    print("means depth-adaptive rank allocation helps at equal cost. Measure the per-layer profile with 252 first.", flush=True)
 
 
 if __name__ == "__main__":

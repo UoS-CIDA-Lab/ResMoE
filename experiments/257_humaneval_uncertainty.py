@@ -18,6 +18,7 @@ from __future__ import annotations
 import sys, pathlib, gc, os, json, subprocess, tempfile
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from experiments.reproducibility import load_mbpp_code
 import torch, torch.nn as nn, torch.nn.functional as F
 
 MODEL = os.environ.get("HHMODEL", "Qwen/Qwen2.5-Coder-1.5B")
@@ -118,17 +119,12 @@ def boot_ci(v, n=10000):
     return float(bs[int(0.025 * n)]), float(bs[int(0.975 * n)])
 
 
-def main():
+def main() -> None:
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from datasets import load_dataset
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True); tok.padding_side = "left"
-    code = []
-    for sp in ["train", "test", "validation", "prompt"]:
-        try:
-            code += load_dataset("mbpp", split=sp, trust_remote_code=True)["code"]
-        except Exception:
-            pass
+    code = load_mbpp_code()
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
     problems = list(load_dataset("openai/openai_humaneval", split="test"))
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, trust_remote_code=True).to(dev).eval()

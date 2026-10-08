@@ -7,7 +7,9 @@ Run: python3 experiments/243_santacoder_java_corr.py
 from __future__ import annotations
 import sys, pathlib, gc, os, types
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from experiments.reproducibility import load_mbpp_code
 import torch, torch.nn as nn, torch.nn.functional as F
+from mple_java.runtime import require_java_environment
 
 MODEL = os.environ.get("HHMODEL", "bigcode/gpt_bigcode-santacoder")
 N_CALIB = int(os.environ.get("NCALIB", "8192"))
@@ -101,25 +103,21 @@ def fwd(mlp, x):
     return out.reshape(sh)
 
 
-def main():
+def main() -> None:
+    JAR = str(pathlib.Path(__file__).resolve().parents[1] / "mple_java" / "lib" / "javatuples-1.2.jar")
+    WD = str(pathlib.Path(__file__).resolve().parents[1] / "mple_java")
+    if os.environ.get("PPL", "0") != "1":
+        require_java_environment(pathlib.Path(JAR))
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from datasets import load_dataset
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    code = []
-    for sp in ["train", "test", "validation", "prompt"]:
-        try:
-            code += load_dataset("google-research-datasets/mbpp", "full", split=sp)["code"]
-        except Exception:
-            pass
+    code = load_mbpp_code()
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, trust_remote_code=True).to(dev).eval()
     model.config.use_cache = False
     layers = model.transformer.h; nL = len(layers)
     torch.set_grad_enabled(False)
-
-    JAR = str(pathlib.Path(__file__).resolve().parents[1] / "mple_java" / "lib" / "javatuples-1.2.jar")
-    WD = str(pathlib.Path(__file__).resolve().parents[1] / "mple_java")
 
     def set_mode(mode):
         for li in range(nL):

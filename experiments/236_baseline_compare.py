@@ -12,6 +12,7 @@ from __future__ import annotations
 import sys, pathlib, gc, os
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch, torch.nn as nn, torch.nn.functional as F
+from experiments.baseline_grouping import gmoe_weight_groups
 
 MODEL = os.environ.get("HHMODEL", "Qwen/Qwen2.5-Coder-1.5B")
 N_CALIB = int(os.environ.get("NCALIB", "8192"))
@@ -21,18 +22,6 @@ K = 128
 RCORR = 128
 RFEAT = 512
 KEEPS = [float(x) for x in os.environ.get("KEEPS", "0.50,0.25").split(",")]
-
-
-def kmeans_centroids(X, k, iters=20, seed=0):
-    g = torch.Generator(device=X.device).manual_seed(seed)
-    c = X[torch.randperm(X.shape[0], generator=g, device=X.device)[:k]].clone()
-    for _ in range(iters):
-        a = torch.cdist(X, c).argmin(1)
-        for j in range(k):
-            m = a == j
-            if m.any():
-                c[j] = X[m].mean(0)
-    return c
 
 
 def weighted_kmeans_centroids(X, w, k, iters=20, seed=0):
@@ -190,7 +179,7 @@ def main():
 
     def grouping_weight(li):                                       # G-MoE/MoEfication: param clustering
         s = STR[li]; Wg = s['Wg'].float().to(dev)
-        gl = balanced_assign(Wg, kmeans_centroids(Wg, K, seed=0))
+        _, gl = gmoe_weight_groups(Wg, K, dev, seed=0)
         del Wg; gc.collect(); torch.cuda.empty_cache()
         return gsizes(gl, dev), gl
 

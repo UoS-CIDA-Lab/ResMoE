@@ -2,8 +2,8 @@
 oracle selection (exp236 / baseline table); here the selector is fixed to the x-router (exp230 pipeline) and
 only the expert construction changes, with and without the rank-128 correction (trained on the x-router's own
 selection error for that grouping):
-  weight        MoEfication: balanced k-means on the input-weight rows
-  coact         G-MoEfication-style: balanced weighted k-means on the centered, normalized co-activation profile
+  weight        G-MoEfication input-weight grouping: normalized rows and equal-size KMeansConstrained
+  coact         activation-pattern baseline: balanced weighted k-means on the centered, normalized co-activation profile
   keep-pattern  ResMoE: balanced weighted k-means on the per-token co-keep pattern
 Each grouping gets its own x-router (same calibration data, same recipe). Reported per keep: ppl without and
 with correction (first 1024 eval tokens = paper protocol, and all NEVAL tokens) and the in-situ FFN NMSE (per-layer ratio of sums, averaged over layers).
@@ -12,11 +12,17 @@ Env: KEEPS (0.50,0.25), NEVAL (32768), SEED (router / correction MLP init + batc
      SELS (xrouter) selectors to evaluate, e.g. SELS=xrouter,oracle adds group-oracle selection (+ a correction trained
      on the oracle selection's error) for every grouping; GROUPS (weight,coact,keep) subset of groupings; CALIB0 (0) start of the 8192 calibration tokens, e.g. CALIB0=40960
      calibrates on an independent slice after the eval region (eval always = tokens [8192, 8192+NEVAL)).
+Reproducibility: deterministic algorithms are required; SEED controls MLP initialization and batches,
+GROUPING_SEED defaults to SEED and controls clustering initialization. Repeat with the same environment and keep/selector/grouping order.
+The output records package versions, model revision, corpus fingerprints, and token/source hashes.
 """
 from __future__ import annotations
-import sys, pathlib, gc, os, json
+import sys, pathlib, gc, os, json, hashlib, platform
+from typing import TypedDict
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch, torch.nn as nn, torch.nn.functional as F
+from experiments.baseline_grouping import gmoe_weight_groups
 
 MODEL = os.environ.get("HHMODEL", "Qwen/Qwen2.5-Coder-1.5B")
 N_CALIB = 8192
@@ -27,23 +33,22 @@ RCORR = 128
 RFEAT = 512
 KEEPS = [float(k) for k in os.environ.get("KEEPS", "0.50,0.25").split(",")]
 SEED = int(os.environ.get("SEED", "0"))
+GROUPING_SEED = int(os.environ.get("GROUPING_SEED", str(SEED)))
 OUT = os.environ.get("OUT", "")
 CALIB0 = int(os.environ.get("CALIB0", "0"))
 SELS = os.environ.get("SELS", "xrouter").split(",")
-GROUPINGS = [g for g in [('weight', "weight k-means (MoEfication)"), ('coact', "co-activation (G-MoEfication)"), ('keep', "keep-pattern (ResMoE)")]
+GROUPINGS = [g for g in [('weight', "input-weight grouping (G-MoEfication)"), ('coact', "activation-pattern grouping"), ('keep', "keep-pattern (ResMoE)")]
              if g[0] in os.environ.get("GROUPS", "weight,coact,keep").split(",")]
 
 
-def kmeans_centroids(X, k, iters=20, seed=0):
-    g = torch.Generator(device=X.device).manual_seed(seed)
-    c = X[torch.randperm(X.shape[0], generator=g, device=X.device)[:k]].clone()
-    for _ in range(iters):
-        a = torch.cdist(X, c).argmin(1)
-        for j in range(k):
-            m = a == j
-            if m.any():
-                c[j] = X[m].mean(0)
-    return c
+class LayerStats(TypedDict):
+    a: torch.Tensor
+    x: torch.Tensor
+    Wd: torch.Tensor
+    abar: torch.Tensor
+    vn: torch.Tensor
+    xbar: torch.Tensor
+    P: torch.Tensor
 
 
 def weighted_kmeans_centroids(X, w, k, iters=20, seed=0):
@@ -95,18 +100,25 @@ def keep_topB_group(score_g, gsz, gf, B):
     return selg[:, gf]
 
 
-def main():
+def main() -> None:
+    import transformers, datasets
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from datasets import load_dataset
+    source_sha256 = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(SEED)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     code = []
+    fingerprints: dict[str, str] = {}
     for sp in ["train", "test", "validation", "prompt"]:
-        try:
-            code += load_dataset("mbpp", split=sp, trust_remote_code=True)["code"]
-        except Exception:
-            pass
+        dataset = load_dataset("google-research-datasets/mbpp", "full", split=sp)
+        code += dataset["code"]
+        fingerprints[sp] = dataset._fingerprint
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
     assert len(ids) >= max(N_CALIB + N_EVAL, CALIB0 + N_CALIB) and N_EVAL % CHUNK == 0 and N_EVAL >= 1024, (len(ids), N_EVAL)
     assert CALIB0 == 0 or CALIB0 >= N_CALIB + N_EVAL, "independent calibration slice must not overlap the eval region"
@@ -117,7 +129,7 @@ def main():
     downs = [layers[li].mlp.down_proj for li in range(nL)]
     torch.set_grad_enabled(False)
 
-    STR = {}
+    STR: dict[int, LayerStats] = {}
     RUN = dict(G=None, B=0, corr=None, sel='xrouter', err2=None, y2=None)
     XC = {li: None for li in range(nL)}; EHAT = {}
 
@@ -174,7 +186,8 @@ def main():
         RUN['G'] = None
         return first, float(torch.tensor(tot / ntok).exp()), sum(e / y for e, y in zip(RUN['err2'], RUN['y2'])) / nL if RUN['y2'] and RUN['y2'][0] else float('nan')
 
-    capa = {li: [] for li in range(nL)}; capx = {li: [] for li in range(nL)}
+    capa: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}
+    capx: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}
     hs = []
     for li in range(nL):
         hs.append(downs[li].register_forward_pre_hook(
@@ -187,11 +200,13 @@ def main():
         h.remove()
     dff = capa[0][0].shape[1]
     for li in range(nL):
+        if li % 4 == 0:
+            print(f"  calibration PCA layer {li + 1}/{nL}", flush=True)
         a = torch.cat(capa[li]); x = torch.cat(capx[li]).float().to(dev)
         Wd = downs[li].weight.detach().float(); af = a.float().to(dev)
         xbar = x.mean(0); _, _, VtX = torch.linalg.svd(x - xbar, full_matrices=False)
         STR[li] = dict(a=a, x=x.half().cpu(), Wd=Wd, abar=af.mean(0), vn=Wd.norm(dim=0), xbar=xbar, P=VtX[:RFEAT].T)
-        capa[li] = None; capx[li] = None
+        del capa[li], capx[li]
         del af, x; gc.collect(); torch.cuda.empty_cache()
     dense = ppl()
     print(f"  MODEL={MODEL} dff={dff} K={K} r={RCORR} SEED={SEED} NEVAL={N_EVAL} | dense ppl {dense[0]:.3f} (1024) "
@@ -201,13 +216,13 @@ def main():
         """grouping of the given kind (+ its x-router: MLP on PCA(x) -> per-group residual norm)."""
         s = STR[li]; a = s['a'].float().to(dev); dev_a = a - s['abar']; w = (dev_a.abs() * s['vn']).mean(0)
         if kind == 'weight':
-            Wg = gproj[li].weight.detach().float(); gf = balanced_assign(Wg, kmeans_centroids(Wg, K, seed=0))
+            Wg = gproj[li].weight.detach().float(); _, gf = gmoe_weight_groups(Wg, K, dev, GROUPING_SEED)
         else:
             if kind == 'coact':
                 feat = dev_a.T.contiguous(); feat = feat / feat.norm(dim=1, keepdim=True).clamp(min=1e-6)
             else:
                 feat = keep_topB_neuron(dev_a.abs() * s['vn'], int(round(bf * dff))).float().T.contiguous()
-            gf = balanced_assign(feat, weighted_kmeans_centroids(feat, w, K, seed=0)); del feat
+            gf = balanced_assign(feat, weighted_kmeans_centroids(feat, w, K, seed=GROUPING_SEED)); del feat
         rn = torch.zeros(a.shape[0], K, device=dev)
         for g in range(K):
             ix = (gf == g).nonzero().flatten()
@@ -226,15 +241,35 @@ def main():
         del a, z, m, E, Vt; gc.collect(); torch.cuda.empty_cache()
         return Br, pred
 
-    RES = dict(model=MODEL, K=K, rcorr=RCORR, seed=SEED, n_eval=N_EVAL, calib0=CALIB0, dff=dff, dense=dense[:2], keeps={})
+    RES = dict(model=MODEL, K=K, rcorr=RCORR, seed=SEED, grouping_seed=GROUPING_SEED,
+               n_eval=N_EVAL, n_calib=N_CALIB, calib0=CALIB0, chunk=CHUNK,
+               dff=dff, dense=dense[:2], keeps={},
+               reproducibility=dict(
+                   python=platform.python_version(), torch=torch.__version__,
+                   transformers=transformers.__version__, datasets=datasets.__version__,
+                   cuda=torch.version.cuda,
+                   gpu=torch.cuda.get_device_name() if dev == 'cuda' else 'cpu',
+                   model_revision=model.config._commit_hash,
+                   dataset="google-research-datasets/mbpp", dataset_config="full",
+                   dataset_fingerprints=fingerprints,
+                   tokens_sha256=hashlib.sha256(ids.numpy().tobytes()).hexdigest(),
+                   source_sha256=source_sha256,
+                   keep_order=KEEPS, selector_order=SELS,
+                   grouping_order=[kind for kind, _ in GROUPINGS],
+                   deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
+                   cublas_workspace_config=os.environ["CUBLAS_WORKSPACE_CONFIG"],
+                   matmul_allow_tf32=torch.backends.cuda.matmul.allow_tf32,
+                   cudnn_allow_tf32=torch.backends.cudnn.allow_tf32))
     for bf in KEEPS:
         R = RES['keeps'][f"{bf}"] = {}
         print(f"\n  ===== keep{int(bf*100)} (x-router selection) =====", flush=True)
         print(f"  {'grouping':<32} {'sel':>8} | {'ppl 1024':>9} {'ppl all':>9} {'NMSE':>6} | {'+corr 1024':>10} {'+corr all':>9} {'NMSE':>6}", flush=True)
         for kind, name in GROUPINGS:
+            print(f"  keep{int(bf*100)} {kind}: training grouping/router ({nL} layers)", flush=True)
             G = {li: build(li, kind, bf) for li in range(nL)}
             for sel in SELS:
                 nc = ppl(G, bf, sel=sel)
+                print(f"  keep{int(bf*100)} {sel}: training correction ({nL} layers)", flush=True)
                 CORR = {li: train_corr(li, G[li], bf, sel) for li in range(nL)}
                 wc = ppl(G, bf, corr=CORR, sel=sel)
                 if sel == 'xrouter':

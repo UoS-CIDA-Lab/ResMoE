@@ -5,11 +5,19 @@ always-on rank-r path), add ê=B_r·ĉ to the group-oracle output. Measure how m
 ceiling SURVIVES prediction. Compare per r: group-oracle (no corr) | +oracle-corr (true e) | +predicted-corr
 (from x). Qwen(SwiGLU), keep-pattern grouping K=128, oracle group select, keep50/25.
 Run: HHMODEL=Qwen/Qwen2.5-Coder-1.5B python3 experiments/228_deployable_correction.py
+For limited GPU memory: CALIBRATION_DEVICE=cpu keeps all calibration tokens,
+uses CPU SVD and grouping-weight averages, and batches distance/error calculations.
+The default model-device setting preserves the original SVD layout and error GEMM size.
 """
 from __future__ import annotations
 import sys, pathlib, gc, os
+from enum import Enum
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from experiments.reproducibility import configure_determinism, report_provenance, report_metrics
 import torch, torch.nn as nn, torch.nn.functional as F
+
+SEED = int(os.environ.get("SEED", "0"))
+configure_determinism(SEED)
 
 MODEL = os.environ.get("HHMODEL", "Qwen/Qwen2.5-Coder-1.5B")
 N_CALIB = int(os.environ.get("NCALIB", "8192"))   # reduce for big models (7B) to fit GPU
@@ -18,14 +26,50 @@ CHUNK = int(os.environ.get("CHUNK", "512"))       # reduce eval-forward memory f
 K = 128
 RMAX = 128
 RANKS = [16, 32, 64, 128]
-KEEPS = [0.50, 0.25]
+KEEPS = [float(x) for x in os.environ.get("KEEPS", "0.50,0.25").split(",")]
+if not KEEPS or any(not 0 < keep <= 1 for keep in KEEPS):
+    raise ValueError("KEEPS must contain fractions in (0, 1]")
 
 
-def weighted_kmeans_centroids(X, w, k, iters=20, seed=0):
+class CalibrationDevice(Enum):
+    MODEL = "model"
+    CPU = "cpu"
+
+
+CALIBRATION_DEVICE = CalibrationDevice(os.environ.get("CALIBRATION_DEVICE", "model"))
+
+
+def centroid_distances(patterns: torch.Tensor, centroids: torch.Tensor) -> torch.Tensor:
+    """Bound the distance calculation's temporary storage without dropping neurons."""
+    batch_size = 4096 if CALIBRATION_DEVICE is CalibrationDevice.CPU else patterns.shape[0]
+    return torch.cat([
+        torch.cdist(patterns[c0:c0 + batch_size], centroids)
+        for c0 in range(0, patterns.shape[0], batch_size)
+    ])
+
+
+def right_singular_basis(
+    matrix: torch.Tensor, rank: int, center: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Preserve the model-device SVD layout; compact the basis for CPU calibration."""
+    if not 1 <= rank <= min(matrix.shape):
+        raise ValueError("SVD rank must be within the matrix dimensions")
+    svd_input = matrix.cpu() if CALIBRATION_DEVICE is CalibrationDevice.CPU else matrix
+    if center is not None:
+        svd_input = svd_input - center.to(svd_input.device)
+    _, _, vectors = torch.linalg.svd(svd_input, full_matrices=False)
+    if CALIBRATION_DEVICE is CalibrationDevice.MODEL:
+        return vectors[:rank].T
+    return vectors[:rank].T.clone(memory_format=torch.contiguous_format).to(matrix.device)
+
+
+def weighted_kmeans_centroids(
+    X: torch.Tensor, w: torch.Tensor, k: int, iters: int = 20, seed: int = 0
+) -> torch.Tensor:
     g = torch.Generator(device=X.device).manual_seed(seed)
     c = X[torch.randperm(X.shape[0], generator=g, device=X.device)[:k]].clone()
     for _ in range(iters):
-        a = torch.cdist(X, c).argmin(1)
+        a = centroid_distances(X, c).argmin(1)
         for j in range(k):
             m = a == j
             if m.any():
@@ -33,8 +77,8 @@ def weighted_kmeans_centroids(X, w, k, iters=20, seed=0):
     return c
 
 
-def balanced_assign(X, centroids):
-    D = torch.cdist(X, centroids); n, k = D.shape
+def balanced_assign(X: torch.Tensor, centroids: torch.Tensor) -> torch.Tensor:
+    D = centroid_distances(X, centroids); n, k = D.shape
     cap = (n + k - 1) // k
     pref = D.argsort(1); d12 = D.gather(1, pref[:, :2]); regret = d12[:, 1] - d12[:, 0]
     order = regret.argsort(descending=True).tolist(); pref_l = pref.tolist()
@@ -46,11 +90,14 @@ def balanced_assign(X, centroids):
     return torch.tensor(assign, device=X.device, dtype=torch.long)
 
 
-def mlp_fit(X, Y, dev, steps=3000, hidden=512, lr=3e-3, bs=2048):
-    torch.manual_seed(0)  # pin Linear init so the predictor is a deterministic fn of (X,Y) across scripts
+def mlp_fit(
+    X: torch.Tensor, Y: torch.Tensor, dev: str, steps: int = 3000,
+    hidden: int = 512, lr: float = 3e-3, bs: int = 2048,
+) -> nn.Sequential:
+    torch.manual_seed(SEED)  # matched predictor initialization within each conversion seed
     net = nn.Sequential(nn.Linear(X.shape[1], hidden), nn.GELU(), nn.Linear(hidden, Y.shape[1])).to(dev).float()
     opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
-    gen = torch.Generator(device=dev).manual_seed(0)
+    gen = torch.Generator(device=dev).manual_seed(SEED)
     with torch.enable_grad():
         for _ in range(steps):
             bi = torch.randint(0, X.shape[0], (bs,), generator=gen, device=dev)
@@ -77,18 +124,17 @@ def oracle_mask(a, abar, vn, gsz, gf, B):
     return keep_topB_group(sg, gsz, gf, B).to(a.dtype)
 
 
-def main():
+def main() -> None:
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from datasets import load_dataset
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    code = []
+    code: list[str] = []
+    fingerprints: dict[str, str] = {}
     for sp in ["train", "test", "validation", "prompt"]:
-        try:
-            code += load_dataset("google-research-datasets/mbpp", "full", split=sp)["code"]
-        except Exception as _e:
-            print(f"  [mbpp load] split {sp} FAILED: {type(_e).__name__}: {str(_e)[:120]}", flush=True)
-    print(f"  [mbpp load] code items={len(code)}", flush=True)
+        dataset = load_dataset("google-research-datasets/mbpp", "full", split=sp)
+        fingerprints[sp] = dataset._fingerprint
+        code.extend(dataset["code"])
     ids = tok("\n\n".join(code), return_tensors="pt").input_ids[0]
     print(f"  [mbpp load] ids tokens={ids.numel()}", flush=True)
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16, trust_remote_code=True).to(dev).eval()
@@ -96,8 +142,11 @@ def main():
     layers = model.model.layers; nL = len(layers)
     gproj = [layers[li].mlp.gate_proj for li in range(nL)]
     downs = [layers[li].mlp.down_proj for li in range(nL)]
-    print(f"  MODEL={MODEL} [SwiGLU] layers={nL} K={K} ranks={RANKS}", flush=True)
+    print(f"  MODEL={MODEL} [SwiGLU] layers={nL} K={K} ranks={RANKS} CALIBRATION_DEVICE={CALIBRATION_DEVICE.value}", flush=True)
     torch.set_grad_enabled(False)
+    report_provenance(source=__file__, model=MODEL, revision=model.config._commit_hash,
+                      seed=SEED, tokens=ids, fingerprints=fingerprints,
+                      calibration_items=N_CALIB, evaluation_items=N_EVAL, chunk=CHUNK)
 
     CFG = {li: {'active': False} for li in range(nL)}
     XC = {li: None for li in range(nL)}; STASH = {li: None for li in range(nL)}
@@ -157,9 +206,10 @@ def main():
         return float(torch.tensor(ce_eval()).exp())
 
     dense_ppl = ppl()
+    report_metrics(dict(seed=SEED, configuration="dense", ppl=dense_ppl))
     print(f"  dense ppl {dense_ppl:.3f}", flush=True)
 
-    capa = {li: [] for li in range(nL)}; capx = {li: [] for li in range(nL)}
+    capa: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}; capx: dict[int, list[torch.Tensor]] = {li: [] for li in range(nL)}
     hs = []
     for li in range(nL):
         hs.append(downs[li].register_forward_pre_hook(
@@ -178,34 +228,48 @@ def main():
         a = torch.cat(capa[li]); x = torch.cat(capx[li]).float().to(dev)
         Wd = downs[li].weight.detach().float().to(dev); Wd = Wd if Wd.shape[1] == dff else Wd.T
         af = a.float().to(dev); vn = Wd.norm(dim=0); abar = af.mean(0)
-        xbar = x.mean(0); _, _, VtX = torch.linalg.svd(x - xbar, full_matrices=False)
-        STR[li] = dict(a=a, x=x.half().cpu(), abar=abar, vn=vn, Wd=Wd.cpu(), xbar=xbar, P=VtX[:512].T)
-        capa[li] = None; capx[li] = None
-        del af; gc.collect(); torch.cuda.empty_cache()
+        xbar = x.mean(0); P = right_singular_basis(x, 512, center=xbar)
+        STR[li] = dict(a=a, x=x.half().cpu(), abar=abar, vn=vn, Wd=Wd.cpu(), xbar=xbar, P=P)
+        del capa[li], capx[li]
+        del af, x, Wd; gc.collect(); torch.cuda.empty_cache()
 
-    def grouping(li, bf):
-        s = STR[li]; a = s['a'].float().to(dev); vn = s['vn']; abar = s['abar']; B = int(round(bf * dff))
-        Bind = keep_topB_neuron((a - abar).abs() * vn, B).float()
-        w = ((a - abar).abs() * vn).mean(0)
-        gl = balanced_assign(Bind.T.contiguous(), weighted_kmeans_centroids(Bind.T.contiguous(), w, K, seed=0))
+    def grouping(li: int, bf: float) -> tuple[torch.Tensor, torch.Tensor]:
+        s = STR[li]; vn = s['vn']; abar = s['abar']; B = int(round(bf * dff))
+        bind_chunks: list[torch.Tensor] = []
+        score_chunks: list[torch.Tensor] = []
+        for c0 in range(0, s['a'].shape[0], CHUNK):
+            a = s['a'][c0:c0 + CHUNK].float().to(dev)
+            score = (a - abar).abs() * vn
+            bind_chunks.append(keep_topB_neuron(score, B).float().cpu())
+            score_chunks.append(score.cpu())
+        patterns = torch.cat(bind_chunks).T.contiguous().to(dev)
+        mean_device = torch.device("cpu") if CALIBRATION_DEVICE is CalibrationDevice.CPU else torch.device(dev)
+        w = torch.cat(score_chunks).to(mean_device).mean(0).to(dev)
+        gl = balanced_assign(patterns, weighted_kmeans_centroids(patterns, w, K, seed=SEED))
         gsz = torch.zeros(K, device=dev)
         for g in range(K):
             gsz[g] = (gl == g).sum()
-        del a, Bind; gc.collect(); torch.cuda.empty_cache()
+        del a, score, patterns, bind_chunks, score_chunks; gc.collect(); torch.cuda.empty_cache()
         return gsz, gl
 
-    def basis_and_pred(li, bf, gsz, gf):
-        s = STR[li]; a = s['a'].float().to(dev); abar = s['abar']; vn = s['vn']; Wd = s['Wd'].to(dev)
+    def basis_and_pred(
+        li: int, bf: float, gsz: torch.Tensor, gf: torch.Tensor
+    ) -> tuple[torch.Tensor, nn.Sequential]:
+        s = STR[li]; abar = s['abar']; vn = s['vn']; Wd = s['Wd'].to(dev)
         B = int(round(bf * dff))
-        m = oracle_mask(a, abar, vn, gsz, gf, B)
-        drop = a - (a * m + abar * (1 - m))
-        E = drop @ Wd.T                                      # [N,d]
-        _, _, Vt = torch.linalg.svd(E, full_matrices=False)
-        Br = Vt[:RMAX].T                                     # [d,RMAX]
+        error_chunks: list[torch.Tensor] = []
+        batch_size = CHUNK if CALIBRATION_DEVICE is CalibrationDevice.CPU else s['a'].shape[0]
+        for c0 in range(0, s['a'].shape[0], batch_size):
+            a = s['a'][c0:c0 + batch_size].float().to(dev)
+            m = oracle_mask(a, abar, vn, gsz, gf, B)
+            drop = a - (a * m + abar * (1 - m))
+            error_chunks.append((drop @ Wd.T).cpu())
+        E = torch.cat(error_chunks).to(dev)                   # [N,d], all calibration tokens
+        Br = right_singular_basis(E, RMAX)                    # [d,RMAX]
         c = E @ Br                                           # [N,RMAX] correction coords (targets)
         z = (s['x'].float().to(dev) - s['xbar']) @ s['P']
         pred = mlp_fit(z, c, dev)
-        del a, m, drop, E, Vt, c, z; gc.collect(); torch.cuda.empty_cache()
+        del a, m, drop, E, Wd, c, z; gc.collect(); torch.cuda.empty_cache()
         return Br, pred
 
     def setcfg(bf, GRP, corr=None, r=None, BR=None, PRED=None, neuron=False):
@@ -225,6 +289,7 @@ def main():
         GRP = {li: grouping(li, bf) for li in range(nL)}
         setcfg(bf, GRP); base = ppl(); off()
         setcfg(bf, GRP, neuron=True); nu = ppl(); off()
+        report_metrics(dict(seed=SEED, keep=bf, dense=dense_ppl, group_oracle=base, neuron_oracle=nu))
         print(f"  keep{int(bf*100)}: group-oracle {base:.3f} | neu-oracle {nu:.3f} | dense {dense_ppl:.3f}", flush=True)
         BR = {}; PRED = {}
         for li in range(nL):
@@ -234,6 +299,7 @@ def main():
             setcfg(bf, GRP, corr='oracle', r=r, BR=BR); oc = ppl(); off()
             setcfg(bf, GRP, corr='pred', r=r, BR=BR, PRED=PRED); pc = ppl(); off()
             print(f"  {r:>4} | {oc:>12.3f} | {pc:>15.3f}", flush=True)
+            report_metrics(dict(seed=SEED, keep=bf, rank=r, true_coordinates=oc, predicted_coordinates=pc))
         print("", flush=True)
     print("READ: predicted-corr between group-oracle (no corr) and oracle-corr => how much of the low-rank", flush=True)
     print("output correction is RECOVERABLE from x (deployable). If predicted≈oracle => A is deployably correctable.", flush=True)

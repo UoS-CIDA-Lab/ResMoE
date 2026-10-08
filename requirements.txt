@@ -1,16 +1,18 @@
-# ResMoE — tested with Python 3.12
-# torch pinned to 2.7.1: its default PyPI wheel is cu126, which runs on CUDA 12.x
-# drivers (verified on driver 12.3). Newer torch defaults to cu130 wheels that
-# need a CUDA 13 driver (2.12.1+cu130 -> cuda unavailable here). torch<2.6 is
-# also ruled out: transformers 5.x refuses to torch.load .bin checkpoints
-# (e.g. facebook/opt-1.3b) on torch<2.6 (CVE-2025-32434).
-torch==2.7.1
-transformers>=4.45
-datasets>=2.20
-numpy>=1.26
-matplotlib>=3.7          # effective-rank depth-profile plot (252)
-seqeval                  # NER span-F1 (248 mBERT modularity)
+# ResMoE — Python 3.12; core versions from the AISTATS 2027 three-seed runs.
+# Install the CUDA 12.6 torch wheel FIRST, using the command in README.md.
+# The default PyPI torch 2.12.1 wheel uses CUDA 13 and does not work with
+# the CUDA 12.x driver used for these experiments.
+torch==2.12.1
+transformers==5.12.1
+datasets==5.0.0
+numpy==2.4.4
+matplotlib==3.11.0       # effective-rank depth-profile plot (252)
+seqeval==1.2.2           # NER span-F1 (248 mBERT modularity)
+k-means-constrained==0.7.6  # shared official G-MoEfication input-weight grouping
+ortools==9.11.4210          # tested min-cost-flow solver for constrained k-means
 # downstream eval (SuperGLUE / commonsense / HumanEval harnesses)
-lm-eval>=0.4.3
-accelerate>=1.1        # hard import of lm_eval.models.huggingface (211/232/237/238/244)
+lm-eval==0.4.12
+accelerate==1.15.0       # required by lm_eval.models.huggingface
+sentencepiece==0.2.1   # T5 tokenizers in a cache-free environment
+protobuf>=4.25,<7     # tokenizer conversion
 # MultiPL-E Java evaluation also requires a JDK (javac/java) on PATH.

@@ -1,190 +1,249 @@
-"""Experiment 214 — CONDITIONAL-MEAN representative: fix the mean-rep blind spot (user's insight).
-The representative for a DROPPED neuron should be E[a_k | k is dropped] (mean activation CONDITIONED
-on being selected for dropping), NOT the unconditional mean abar_k. The dropped set is a biased
-(low-activation) subsample, so unconditional mean OVER-estimates dropped neurons => injects bias. For
-ReLU, dropped = inactive => E[a_k|dropped] ≈ 0 (so 'rep=0 for ReLU' is the special case of this general
-principle). G-MoE uses unconditional mean = blind spot. This experiment tests, on OPT(ReLU), ORACLE ppl:
-  grp_mean     : group select, rep = UNCONDITIONAL mean   [= G-MoE / exp213 baseline, collapses]
-  grp_condmean : group select, rep = CONDITIONAL mean E[a_k|group dropped]
-  neuron_condmean : per-neuron select, rep = CONDITIONAL mean E[a_k|neuron dropped]
-  neuron_zero  : per-neuron select, rep = 0  (ReLU limiting case; sanity vs condmean)
-dropped-set for the conditional mean is defined on calibration by the rep-independent rule 'keep top-B
-by |a_k|*||v_k||'. PREDICTION: condmean ≈ neuron_zero ≈ dense at aggressive keep => collapse was the
-mean-rep, not ReLU. Run: HHMODEL=facebook/opt-1.3b python3 experiments/214_opt_repzero.py
+"""OPT representative ablation with the selection rule held fixed.
+At each keep rate, compare zero, unconditional mean and conditional mean at
+both group and neuron granularity. Selection always uses |activation|*||v||;
+changing the representative does not change the selection scoring formula.
+The conditional mean is fitted on dense calibration activations only.
 """
 from __future__ import annotations
-import sys, pathlib, types, gc, os
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-import torch, torch.nn.functional as F
+
+import gc
+import hashlib
+import json
+import math
+import os
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+import torch
+from torch import nn
+from torch.nn import functional as F
+from transformers import AutoTokenizer
+from transformers.models.opt.configuration_opt import OPTConfig
+from transformers.models.opt.modeling_opt import OPTDecoderLayer, OPTDecoder, OPTModel, OPTForCausalLM
 
 MODEL = os.environ.get("HHMODEL", "facebook/opt-1.3b")
-N_CALIB = 8192
-N_EVAL = 1024
+SEED = int(os.environ.get("SEED", "0"))
+N_CALIB = int(os.environ.get("NCALIB", "8192"))
+N_EVAL = int(os.environ.get("NEVAL", "4096"))
 CHUNK = 512
-KROUTE = 64
-KEEPS = [0.50, 0.25, 0.10]
+K = 64
+KEEPS = [float(v) for v in os.environ.get("KEEPS", "0.50,0.25,0.10").split(",")]
+OUT = os.environ.get("OUT", "")
 
 
-def kmeans(X, k, iters=12, seed=0):
-    g = torch.Generator(device=X.device).manual_seed(seed)
-    c = X[torch.randperm(X.shape[0], generator=g, device=X.device)[:k]].clone()
-    for _ in range(iters):
-        a = torch.cdist(X, c).argmin(1)
-        for j in range(k):
-            m = a == j
-            if m.any():
-                c[j] = X[m].mean(0)
-    return a
+class Granularity(Enum):
+    GROUP = "group"
+    NEURON = "neuron"
 
 
-def keep_topB_neuron(score, B):
-    """score:[N,dff] desc-keep top-B per row -> bool keep mask."""
-    if B >= score.shape[1]:
-        return torch.ones_like(score, dtype=torch.bool)
-    thr = score.kthvalue(score.shape[1] - B + 1, dim=1, keepdim=True).values
-    return score >= thr
+class Representative(Enum):
+    ZERO = "zero"
+    MEAN = "mean"
+    CONDITIONAL = "conditional_mean"
 
 
-def keep_topB_group(score_g, gsz, grp_full, B):
-    """score_g:[N,Kc] group scores; keep groups (desc) until cum neuron budget B -> neuron keep mask."""
-    N, Kc = score_g.shape
-    order = score_g.argsort(1, descending=True); so = gsz[order]
-    keep_ord = (so.cumsum(1) - so) < B
-    selg = torch.zeros(N, Kc, dtype=torch.bool, device=score_g.device).scatter_(1, order, keep_ord)
-    return selg[:, grp_full]
+@dataclass
+class Stats:
+    activations: torch.Tensor
+    mean: torch.Tensor
+    vn: torch.Tensor
+    groups: torch.Tensor
+    sizes: torch.Tensor
 
 
-def compute_masked(cfg, a):
-    """a:[N,dff] post-ReLU. rep is per-neuron [dff]; select by drop-cost ((a-rep)*vn)^2."""
-    vn = cfg['vn']; rep = cfg['rep']; B = cfg['B']
-    cost = ((a.float() - rep) * vn) ** 2
-    if cfg['gran'] == 'neuron':
-        keep = keep_topB_neuron(cost, B)
-    else:
-        Kc = cfg['gsz'].shape[0]
-        sg = torch.zeros(a.shape[0], Kc, device=a.device).index_add_(1, cfg['grp_full'], cost)
-        keep = keep_topB_group(sg, cfg['gsz'], cfg['grp_full'], B)
-    m = keep.to(a.dtype)
-    return a * m + rep.to(a.dtype) * (1 - m)
+@dataclass
+class State:
+    granularity: Granularity
+    budget: int
+    representative: torch.Tensor
 
 
-def main():
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+def keep_mask(a: torch.Tensor, s: Stats, granularity: Granularity, budget: int) -> torch.Tensor:
+    scores = (a.float() * s.vn).square()
+    if granularity is Granularity.NEURON:
+        # Break zero-activation ties by neuron index to enforce the stated budget.
+        order = scores.argsort(dim=1, descending=True, stable=True)[:, :budget]
+        return torch.zeros_like(scores, dtype=torch.bool).scatter_(1, order, True)
+    group_scores = torch.zeros((a.shape[0], K), device=a.device).index_add_(1, s.groups, scores)
+    order = group_scores.argsort(dim=1, descending=True, stable=True)
+    sizes = s.sizes[order]
+    take = sizes.cumsum(1) - sizes < budget
+    groups = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(1, order, take)
+    return groups[:, s.groups]
+
+
+class ExperimentalOutput(nn.Linear):
+    def __init__(self, config: OPTConfig) -> None:
+        super().__init__(config.ffn_dim, config.hidden_size, bias=config.enable_bias)
+        self.capture = False
+        self.activations: list[torch.Tensor] = []
+        self.stats: Stats | None = None
+        self.state: State | None = None
+        self.kept = 0
+        self.total = 0
+
+    def forward(self, a: torch.Tensor) -> torch.Tensor:
+        if self.capture:
+            self.activations.append(a.reshape(-1, a.shape[-1]).half().cpu())
+        if self.state is not None:
+            if self.stats is None:
+                raise RuntimeError("Missing calibration")
+            flat = a.reshape(-1, a.shape[-1])
+            mask = keep_mask(flat, self.stats, self.state.granularity, self.state.budget)
+            self.kept += int(mask.sum().item())
+            self.total += mask.numel()
+            a = torch.where(mask, flat, self.state.representative.to(flat.dtype)).reshape_as(a)
+        return F.linear(a, self.weight, self.bias)
+
+
+class ExperimentalLayer(OPTDecoderLayer):
+    def __init__(self, config: OPTConfig, layer_idx: int) -> None:
+        super().__init__(config, layer_idx)
+        self.fc2 = ExperimentalOutput(config)
+
+
+class ExperimentalDecoder(OPTDecoder):
+    def __init__(self, config: OPTConfig) -> None:
+        super().__init__(config)
+        self.layers = nn.ModuleList([ExperimentalLayer(config, i) for i in range(config.num_hidden_layers)])
+
+
+class ExperimentalModel(OPTModel):
+    def __init__(self, config: OPTConfig) -> None:
+        super().__init__(config)
+        self.decoder = ExperimentalDecoder(config)
+
+
+class ExperimentalLM(OPTForCausalLM):
+    def __init__(self, config: OPTConfig) -> None:
+        super().__init__(config)
+        self.model = ExperimentalModel(config)
+
+
+def kmeans(x: torch.Tensor) -> torch.Tensor:
+    generator = torch.Generator(device=x.device).manual_seed(SEED)
+    centers = x[torch.randperm(x.shape[0], generator=generator, device=x.device)[:K]].clone()
+    labels = torch.zeros(x.shape[0], device=x.device, dtype=torch.long)
+    for _ in range(12):
+        labels = torch.cdist(x, centers).argmin(1)
+        for g in range(K):
+            if (labels == g).any():
+                centers[g] = x[labels == g].mean(0)
+    return labels
+
+
+def main() -> None:
     from datasets import load_dataset
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    wt = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
-    ids = tok("\n\n".join(t for t in wt["text"] if t.strip()), return_tensors="pt").input_ids[0]
-    print(f"  MODEL={MODEL}  tokens={ids.numel()}", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float16).to(dev).eval()
+    torch.manual_seed(SEED)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    dev = "cuda"
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+    ids = tok("\n\n".join(t for t in ds["text"] if t.strip()), return_tensors="pt").input_ids[0]
+    if ids.numel() < N_CALIB + N_EVAL:
+        raise ValueError("Insufficient corpus tokens")
+    model = ExperimentalLM.from_pretrained(MODEL, dtype=torch.float16).to(dev).eval()
     model.config.use_cache = False
-    layers = model.model.decoder.layers; nL = len(layers)
+    outputs: list[ExperimentalOutput] = []
+    for layer in model.model.decoder.layers:
+        if not isinstance(layer, ExperimentalLayer):
+            raise TypeError("Unexpected decoder layer")
+        outputs.append(layer.fc2)
     torch.set_grad_enabled(False)
+    metadata = dict(model=MODEL, revision=model.config._commit_hash, seed=SEED,
+                    torch=torch.__version__, gpu=torch.cuda.get_device_name(), groups=K,
+                    dataset="Salesforce/wikitext", config="wikitext-2-raw-v1", split="test",
+                    fingerprint=ds._fingerprint, calib_tokens=N_CALIB, eval_tokens=N_EVAL,
+                    chunk=CHUNK, selection="activation magnitude times output-weight norm, independent of representative",
+                    tie_rule="exact top-budget selection, stable ties by neuron index",
+                    source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    tokens_sha256=hashlib.sha256(ids[:N_CALIB + N_EVAL].numpy().tobytes()).hexdigest())
+    print(json.dumps(metadata), flush=True)
+    rows: list[dict[str, object]] = []
 
-    CFG = {li: {'active': False} for li in range(nL)}
+    def evaluate(tag: str) -> dict[str, object]:
+        for output in outputs:
+            output.kept = output.total = 0
+        loss = 0.0
+        tokens = 0
+        first_loss = 0.0
+        first_tokens = 0
+        for off in range(0, N_EVAL, CHUNK):
+            seq = ids[N_CALIB + off:N_CALIB + min(off + CHUNK, N_EVAL)].unsqueeze(0).to(dev)
+            value = F.cross_entropy(model(seq).logits[0, :-1].float(), seq[0, 1:], reduction="sum").item()
+            loss += value
+            tokens += seq.shape[1] - 1
+            if off < 1024:
+                first_loss += value
+                first_tokens += seq.shape[1] - 1
+        total = sum(o.total for o in outputs)
+        result: dict[str, object] = dict(tag=tag, ppl=math.exp(loss / tokens),
+                                         ppl_first1024=math.exp(first_loss / first_tokens),
+                                         actual_keep=sum(o.kept for o in outputs) / total if total else 1.0)
+        print(json.dumps(result), flush=True)
+        return result
 
-    def fc2_pre(li):
-        def hook(_m, args):
-            cfg = CFG[li]
-            if not cfg['active']:
-                return None
-            a = args[0]; sh = a.shape
-            masked = compute_masked(cfg, a.reshape(-1, sh[-1]))
-            return (masked.reshape(sh),) + args[1:]
-        return hook
-    for li in range(nL):
-        layers[li].fc2.register_forward_pre_hook(fc2_pre(li))
+    dense = evaluate("dense")
+    for output in outputs:
+        output.capture = True
+    for off in range(0, N_CALIB, CHUNK):
+        model(ids[off:off + CHUNK].unsqueeze(0).to(dev))
+    for li, layer in enumerate(model.model.decoder.layers):
+        if not isinstance(layer, ExperimentalLayer):
+            raise TypeError("Unexpected decoder layer")
+        output = layer.fc2
+        output.capture = False
+        a = torch.cat(output.activations)
+        output.activations.clear()
+        groups = kmeans(F.normalize(layer.fc1.weight.detach().float(), dim=1))
+        sizes = torch.bincount(groups, minlength=K)
+        output.stats = Stats(a, a.float().to(dev).mean(0), output.weight.detach().float().norm(dim=0), groups, sizes)
+        print(f"Prepared layer {li + 1}/{len(outputs)}", flush=True)
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    @torch.no_grad()
-    def ce_eval():
-        tot = 0.0; ntok = 0
-        for c0 in range(N_CALIB, N_CALIB + N_EVAL, CHUNK):
-            xx = ids[c0:c0 + CHUNK].unsqueeze(0).to(dev)
-            lo = model(xx).logits[0, :-1].float()
-            tgt = ids[c0 + 1:c0 + CHUNK].to(dev)
-            tot += F.cross_entropy(lo, tgt, reduction='sum').item(); ntok += tgt.numel()
-        return tot / ntok
+    def save() -> None:
+        if OUT:
+            Path(OUT).write_text(json.dumps(dict(metadata=metadata, dense=dense, rows=rows), indent=2))
 
-    def ppl():
-        return float(torch.tensor(ce_eval()).exp())
-
-    dense_ppl = ppl()
-    print(f"  dense ppl {dense_ppl:.3f}", flush=True)
-
-    capa = {li: [] for li in range(nL)}
-    hs = []
-    for li in range(nL):
-        hs.append(layers[li].fc2.register_forward_pre_hook(
-            (lambda li: (lambda _m, a: capa[li].append(a[0].reshape(-1, a[0].shape[-1]).half().cpu())))(li)))
-    for c0 in range(0, N_CALIB, CHUNK):
-        model(ids[c0:c0 + CHUNK].unsqueeze(0).to(dev))
-    for h in hs:
-        h.remove()
-    dff = capa[0][0].shape[1]
-    act0 = float((torch.cat(capa[0]) > 0).float().mean())
-    actM = float((torch.cat(capa[nL // 2]) > 0).float().mean())
-    print(f"  OPT: {nL} layers, dff={dff}; ReLU active frac layer0={act0:.3f} mid={actM:.3f}", flush=True)
-
-    STR = {}
-    for li in range(nL):
-        A = torch.cat(capa[li])                              # [Ncalib, dff] fp16 CPU (kept for condmean)
-        a = A.float().to(dev)
-        Wup = layers[li].fc1.weight.detach().float().to(dev); Wup = Wup if Wup.shape[0] == dff else Wup.T
-        Wd = layers[li].fc2.weight.detach().float().to(dev); Wd = Wd if Wd.shape[1] == dff else Wd.T
-        vn = Wd.norm(dim=0)
-        grp_local = kmeans(F.normalize(Wup, dim=1), KROUTE, seed=0)
-        Kc = int(grp_local.max().item()) + 1
-        gsz = torch.zeros(Kc, device=dev); grp_full = torch.zeros(dff, dtype=torch.long, device=dev)
-        for g in range(Kc):
-            ix = (grp_local == g).nonzero().flatten()
-            gsz[g] = len(ix); grp_full[ix] = g
-        STR[li] = dict(A=A, mean=a.mean(0), vn=vn, gsz=gsz, grp_full=grp_full)
-        capa[li] = None
-        del a, Wup, Wd; gc.collect(); torch.cuda.empty_cache()
-
-    def condmean(li, bf, gran):
-        """E[a_k | k dropped] on calibration; dropped set by rep-independent rule keep-top-B(|a|*vn)."""
-        s = STR[li]; A = s['A'].float().to(dev); vn = s['vn']; B = int(round(bf * dff))
-        score0 = (A.abs() * vn)                              # rep=0 drop-cost magnitude
-        if gran == 'neuron':
-            keep = keep_topB_neuron(score0, B)
-        else:
-            Kc = s['gsz'].shape[0]
-            sg = torch.zeros(A.shape[0], Kc, device=dev).index_add_(1, s['grp_full'], score0 ** 2)
-            keep = keep_topB_group(sg, s['gsz'], s['grp_full'], B)
-        dropped = (~keep).float()
-        rep = (A * dropped).sum(0) / dropped.sum(0).clamp(min=1.0)
-        del A, score0, keep, dropped; gc.collect(); torch.cuda.empty_cache()
-        return rep
-
-    def setcfg(bf, gran, reptype):
-        B = int(round(bf * dff))
-        for li in range(nL):
-            s = STR[li]
-            if reptype == 'mean':
-                rep = s['mean']
-            elif reptype == 'zero':
-                rep = torch.zeros(dff, device=dev)
-            else:
-                rep = condmean(li, bf, gran)
-            CFG[li].update(dict(active=True, B=B, gran=gran, rep=rep, vn=s['vn'],
-                                gsz=s['gsz'], grp_full=s['grp_full']))
-
-    def set_active(flag):
-        for li in range(nL):
-            CFG[li]['active'] = flag
-
-    print(f"\n  OPT(ReLU) ORACLE ppl (dense {dense_ppl:.3f}): unconditional-mean vs CONDITIONAL-mean vs zero\n", flush=True)
-    print(f"  {'keep':>5} | {'grp+mean':>9} | {'grp+cond':>9} | {'neu+cond':>9} | {'neu+zero':>9}", flush=True)
-    for bf in KEEPS:
-        r = {}
-        for gran, reptype, key in [('group', 'mean', 'gm'), ('group', 'cond', 'gc'),
-                                   ('neuron', 'cond', 'nc'), ('neuron', 'zero', 'nz')]:
-            setcfg(bf, gran, reptype); r[key] = ppl(); set_active(False)
-        print(f"  {int(bf*100):>4}% | {r['gm']:>9.3f} | {r['gc']:>9.3f} | {r['nc']:>9.3f} | {r['nz']:>9.3f}", flush=True)
-    print("\nREAD: if grp+cond/neu+cond << grp+mean (toward dense) => the conditional-mean representative", flush=True)
-    print("fixes the collapse; unconditional mean (G-MoE) was the blind spot. neu+zero≈neu+cond confirms", flush=True)
-    print("E[a|dropped]≈0 for ReLU. This is a general, activation-agnostic representative improvement.", flush=True)
+    save()
+    for keep in KEEPS:
+        budget = max(1, round(keep * model.config.ffn_dim))
+        for granularity in Granularity:
+            conditional: list[torch.Tensor] = []
+            for output in outputs:
+                s = output.stats
+                if s is None:
+                    raise RuntimeError("Missing calibrated state")
+                a = s.activations.float().to(dev)
+                dropped = ~keep_mask(a, s, granularity, budget)
+                rep = (a * dropped).sum(0) / dropped.sum(0).clamp(min=1)
+                conditional.append(rep)
+                del a, dropped
+            for representative in Representative:
+                for li, output in enumerate(outputs):
+                    s = output.stats
+                    if s is None:
+                        raise RuntimeError("Missing calibrated state")
+                    if representative is Representative.ZERO:
+                        rep = torch.zeros_like(s.mean)
+                    elif representative is Representative.MEAN:
+                        rep = s.mean
+                    else:
+                        rep = conditional[li]
+                    output.state = State(granularity, budget, rep)
+                tag = f"keep={keep} granularity={granularity.value} representative={representative.value}"
+                row = evaluate(tag)
+                row.update(keep=keep, granularity=granularity.value, representative=representative.value)
+                rows.append(row)
+                save()
+    print("Completed controlled representative comparison.", flush=True)
 
 
 if __name__ == "__main__":
