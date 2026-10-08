@@ -476,7 +476,7 @@ substitutes for the final submission protocols above.
 | 231 | `python -u experiments/231_corr_vs_moreneurons.py` | Oracle matched-cost diagnostic |
 | 232 | `python -u experiments/232_humaneval_corr.py` | Earlier HumanEval oracle rows |
 | 236 | `python -u experiments/236_baseline_compare.py` | Earlier weight/co-activation/keep-pattern build-up |
-| 237 | `python -u experiments/237_humaneval_baseline.py` | Earlier HumanEval baseline grouping |
+| 237 | `python -u experiments/237_humaneval_baseline.py` | Earlier HumanEval comparison with approximate input-weight grouping |
 | 243 | `HHMODEL=ckpts/santacoder-java PPL=1 KEEPS=0.85,0.50 python -u experiments/243_santacoder_java_corr.py` | Earlier Java-model perplexity; omit `PPL=1` for greedy Java pass@1 |
 | 244 | `HHMODEL=microsoft/phi-2 python -u experiments/244_parallel_superglue.py` | Parallel-block SuperGLUE extension |
 | 253 budget | `HHMODEL=facebook/opt-1.3b RANKMODE=budget python -u experiments/253_budget_correction.py` | Depth-adaptive rank; repeat with `RANKMODE=fixed` |
@@ -487,6 +487,10 @@ historical sweeps have no environment-variable override for token counts or seed
 inspect the constants at the top of the script before changing their protocol.
 The historical HumanEval commands (`232` and `237`) evaluate all 164 programs
 with greedy decoding and the task's limit of 1024 new tokens per completion.
+`237` retains its original approximation: 20 iterations of GPU k-means on
+unnormalized input-weight rows, followed by greedy equal-size assignment.
+Its weight-grouping result differs from the normalized `KMeansConstrained`
+baseline implemented by `236` and `254_matched_compute_xrouter.py`.
 
 T5 downstream exploration (SST-2 zero-shot; MNLI fine-tuning, separate from the
 submitted denoising grid). Expert counts follow `d_ff/32`, and checkpoint names
